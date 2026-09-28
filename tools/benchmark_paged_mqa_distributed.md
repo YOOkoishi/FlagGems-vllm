@@ -43,8 +43,11 @@ python3 tools/benchmark_paged_mqa_distributed.py --plan --plan-world-size 16
 
 在已经跑通Gems的容器中，确认 `torch.cuda.device_count()` 至少等于本机 `--nproc-per-node`。这里的rank对应Torch可见逻辑设备，不直接等于物理板卡。下面假设16个设备都在同一主机；libdevice路径替换为你的实际文件。
 
+单机启动使用static rendezvous与显式loopback地址，避免容器主机名（如p-iluvatar-01）不能解析导致TCPStore一直重试。不要同时添加 `--standalone`，它会强制切回c10d/localhost:0；`--master-addr`无法覆盖该路径。若旧任务正在重试，先Ctrl-C停止，再用新的输出文件名重跑。OMP_NUM_THREADS=1的提示不是此次阻塞原因。[PyTorch启动逻辑](https://github.com/pytorch/pytorch/blob/v2.10.0/torch/distributed/run.py)、[static rendezvous实现](https://github.com/pytorch/pytorch/blob/v2.10.0/torch/distributed/elastic/rendezvous/static_tcp_rendezvous.py)。
+
 ```bash
-torchrun --standalone --nnodes=1 --nproc-per-node=16 \
+torchrun --nnodes=1 --node-rank=0 --nproc-per-node=16 \
+  --rdzv-backend=static --master-addr=127.0.0.1 --master-port=29501 \
   tools/benchmark_paged_mqa_distributed.py \
   --batch 4 --context 4096 --page-size 64 --quant both \
   --libdevice-path /usr/local/corex-4.5.0/nvvm/libdevice/libdevice.compute_bi.10.bc \
@@ -55,7 +58,8 @@ torchrun --standalone --nnodes=1 --nproc-per-node=16 \
 确认通信和两种实现正确后运行默认大任务：
 
 ```bash
-torchrun --standalone --nnodes=1 --nproc-per-node=16 \
+torchrun --nnodes=1 --node-rank=0 --nproc-per-node=16 \
+  --rdzv-backend=static --master-addr=127.0.0.1 --master-port=29501 \
   tools/benchmark_paged_mqa_distributed.py \
   --batch 256 --context 1048576 --page-size 256 --quant both \
   --libdevice-path /usr/local/corex-4.5.0/nvvm/libdevice/libdevice.compute_bi.10.bc \
@@ -95,13 +99,15 @@ KV已预先分片驻留；初始数据生成、H2D传输、进程组初始化、
 强扩展要保持全局B/L、数据、dtype、代码和软件版本相同。默认33GiB KV大任务不适合拿单卡硬跑；要评估相对单卡的加速比，先选择单卡也能容纳的规模，例如B32/L131072：
 
 ```bash
-torchrun --standalone --nproc-per-node=1 \
+torchrun --nnodes=1 --node-rank=0 --nproc-per-node=1 \
+  --rdzv-backend=static --master-addr=127.0.0.1 --master-port=29501 \
   tools/benchmark_paged_mqa_distributed.py \
   --batch 32 --context 131072 --quant both \
   --libdevice-path /usr/local/corex-4.5.0/nvvm/libdevice/libdevice.compute_bi.10.bc \
   --output results/scaling_1.json
 
-torchrun --standalone --nproc-per-node=16 \
+torchrun --nnodes=1 --node-rank=0 --nproc-per-node=16 \
+  --rdzv-backend=static --master-addr=127.0.0.1 --master-port=29501 \
   tools/benchmark_paged_mqa_distributed.py \
   --batch 32 --context 131072 --quant both \
   --libdevice-path /usr/local/corex-4.5.0/nvvm/libdevice/libdevice.compute_bi.10.bc \
@@ -124,6 +130,7 @@ strong_scaling_efficiency = strong_scaling_speedup / rank数量
 
 ```bash
 torchrun --nnodes=2 --nproc-per-node=8 --node-rank=0 \
+  --rdzv-backend=static \
   --master-addr=<节点0可达IP> --master-port=29501 \
   tools/benchmark_paged_mqa_distributed.py \
   --batch 256 --context 1048576 --quant both \

@@ -3,7 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """One paged-MQA workload sharded by KV context across torchrun ranks.
 
-torchrun --standalone --nproc-per-node=16 tools/benchmark_paged_mqa_distributed.py \
+torchrun --nnodes=1 --nproc-per-node=16 --rdzv-backend=static \
+    --master-addr=127.0.0.1 --master-port=29501 \
+    tools/benchmark_paged_mqa_distributed.py \
     --libdevice-path /actual/libdevice.compute_bi.10.bc --output distributed.json
 
 The original single-device kernels are unchanged. Every measured end-to-end
