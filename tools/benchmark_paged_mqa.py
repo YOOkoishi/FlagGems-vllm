@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Serial IxFormer / torch / torch.compile / FlagGems paged-MQA baseline.
+"""Serial torch.compile / FlagGems paged-MQA comparison.
 
 Run from the checkout, using the Python in the working CoreX container:
   python tools/benchmark_paged_mqa.py --vendor iluvatar
-  python tools/benchmark_paged_mqa.py --vendor iluvatar --torch-mode both --quant both
+  python tools/benchmark_paged_mqa.py --vendor iluvatar --quant both --libdevice-path /actual/libdevice.compute_bi.10.bc
 
 This is a benchmark, not a production fallback. next_n=1, D=128 only.
-Native uses prepared BF16 Q/K/weights and an explicitly allocated FP32 output.
-Torch and Gems consume the original packed FP8/FP4 inputs. Native/Gems ratios
-therefore describe different input formats and are NOT a same-format 95% gate.
+Defaults compare only torch.compile and Gems on the same packed FP8/FP4 inputs.
+The compile label is chunked: gather/dot/ReLU/reduction are compiled, while
+decoding and the outer loop also contribute to the measured API latency.
+IxFormer is an optional legacy diagnostic, enabled only with --backends native.
 """
 
 import argparse
@@ -27,6 +28,7 @@ import statistics
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -391,6 +393,73 @@ def benchmark(fn, device, warmup, iterations, repeats):
     }
 
 
+def _readable_libdevice(path):
+    resolved = Path(path).expanduser().resolve()
+    try:
+        with resolved.open("rb") as stream:
+            if not stream.read(1):
+                raise OSError("file is empty")
+    except OSError as exc:
+        raise RuntimeError(
+            f"CoreX libdevice is missing or unreadable: {resolved}. "
+            "Pass --libdevice-path /actual/CoreX/nvvm/libdevice/libdevice.compute_bi.10.bc "
+            "(a file, not a directory). Existing runtime library paths are left unchanged. "
+            f"Details: {exc}"
+        ) from exc
+    return str(resolved)
+
+
+def compiler_preflight(vendor, libdevice_path=None):
+    """Inspect the imported compiler; never guess or switch the CoreX SDK root."""
+    explicit = None
+    if libdevice_path is not None:
+        explicit = _readable_libdevice(libdevice_path)
+        os.environ["TRITON_LIBDEVICE_PATH"] = explicit
+    override = os.environ.get("TRITON_LIBDEVICE_PATH")
+    if override:
+        _readable_libdevice(override)
+    info = {
+        "status": "NOT_APPLICABLE" if vendor != "iluvatar" else "UNVERIFIED",
+        "TRITON_LIBDEVICE_PATH": override,
+        "TRITON_LIBCUDA_PATH": os.environ.get("TRITON_LIBCUDA_PATH"),
+    }
+    if vendor != "iluvatar":
+        return info
+    try:
+        import triton
+        from triton.compiler.compiler import make_backend
+        from triton.runtime import driver
+
+        info["triton_module"] = triton.__file__
+        target = driver.active.get_current_target()
+        backend = make_backend(target)
+        options = backend.parse_options({})
+        effective = dict(options.extern_libs).get("libdevice")
+        info.update(
+            target=str(target),
+            backend=type(backend).__name__,
+            backend_source=inspect.getsourcefile(type(backend)),
+            effective_libdevice=effective,
+        )
+    except Exception as exc:
+        # Internal Triton APIs vary. Do not turn probe failure into a fake PASS.
+        info["probe_error"] = f"{type(exc).__name__}: {exc}"
+        info["probe_traceback"] = traceback.format_exc()
+        info["explicit_file_readable"] = bool(override)
+        return info
+    if not effective:
+        info["probe_error"] = "Backend options did not expose a libdevice path"
+        return info
+    resolved = _readable_libdevice(effective)
+    if explicit and resolved != explicit:
+        raise RuntimeError(
+            f"Compiler resolved libdevice to {resolved}, ignoring explicit override {explicit}"
+        )
+    info["effective_libdevice"] = resolved
+    info["status"] = "OK"
+    return info
+
+
 def environment(device):
     versions = {}
     for name in ("torch", "triton", "flagtree", "ixformer", "vllm", "flaggems-vllm"):
@@ -412,6 +481,8 @@ def environment(device):
         commit = None
     return {
         "python": sys.version,
+        "python_executable": sys.executable,
+        "torch_module": torch.__file__,
         "hostname": socket.gethostname(),
         "pid": os.getpid(),
         "packages": versions,
@@ -466,15 +537,20 @@ def parse_args(argv=None):
     )
     p.add_argument("--chunk-tokens", type=int, default=512)
     p.add_argument(
-        "--torch-mode", choices=("eager", "compile", "both"), default="eager"
+        "--torch-mode", choices=("eager", "compile", "both"), default="compile"
     )
     p.add_argument(
         "--backends",
         nargs="+",
         choices=("native", "torch", "gems"),
-        default=["native", "torch", "gems"],
+        default=["torch", "gems"],
     )
     p.add_argument("--compile-backend", default="inductor")
+    p.add_argument(
+        "--libdevice-path",
+        type=Path,
+        help="explicit CoreX libdevice .bc file; overrides TRITON_LIBDEVICE_PATH only",
+    )
     p.add_argument(
         "--op-file",
         type=Path,
@@ -517,6 +593,10 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     os.environ["GEMS_VENDOR"] = args.vendor
+    if args.libdevice_path is not None:
+        os.environ["TRITON_LIBDEVICE_PATH"] = str(
+            args.libdevice_path.expanduser().resolve()
+        )
     os.environ["FLAGGEMS_FP8_FP4_PAGED_MQA_LOGITS_TLE"] = (
         "1" if args.enable_tle else "0"
     )
@@ -537,17 +617,46 @@ def main(argv=None):
             k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
         },
         "measurement": "sequential eager API calls; first-call compilation and warmup excluded; no CUDA graphs",
-        "comparison": "native BF16 prepared-input baseline differs from FP8/FP4 API; no 95% acceptance claim",
+        "comparison": (
+            "native BF16 prepared-input baseline differs from FP8/FP4 API; diagnostic only"
+            if "native" in args.backends
+            else "torch.compile and Gems use the same packed input API; speedup = compile wall time / Gems wall time"
+        ),
         "results": [],
     }
     print(json.dumps(report["environment"], indent=2, ensure_ascii=False), flush=True)
-    print(
-        "Native: prepared BF16 -> FP32. Torch/Gems: packed FP8/FP4 -> FP32.", flush=True
+    print("Torch/Gems: same packed FP8/FP4 input -> FP32 logits.", flush=True)
+    if "native" in args.backends:
+        print(
+            "Optional native: prepared BF16 input; conversion is outside timing.",
+            flush=True,
+        )
+    needs_compiler = "gems" in args.backends or (
+        "torch" in args.backends and args.torch_mode in ("compile", "both")
     )
-    print(
-        "Native conversion is outside timing. Ratios are not a same-format 95% test.",
-        flush=True,
-    )
+    try:
+        if args.libdevice_path is not None:
+            _readable_libdevice(args.libdevice_path)
+        if device.type == "cuda" and needs_compiler:
+            report["compiler_preflight"] = compiler_preflight(
+                args.vendor, args.libdevice_path
+            )
+            print(
+                "Compiler preflight: "
+                + json.dumps(report["compiler_preflight"], ensure_ascii=False),
+                flush=True,
+            )
+    except Exception as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        report["compiler_preflight"] = {
+            "status": "ERROR",
+            "error": report["error"],
+            "traceback": traceback.format_exc(),
+        }
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+        print(f"Compiler preflight ERROR: {report['error']}", flush=True)
+        return 1
     failed = False
     names = []
     if "native" in args.backends:
@@ -593,6 +702,7 @@ def main(argv=None):
                     },
                 }
                 fn = value = native_ref = None
+                stage = "prepare"
                 try:
                     synchronize(device)
                     if name in ("native", "gems") and device.type != "cuda":
@@ -627,10 +737,12 @@ def main(argv=None):
                         }
                     row["implementation"] = details
                     synchronize(device)
+                    stage = "first_call"
                     start = time.perf_counter()
                     value = fn()
                     synchronize(device)
                     row["first_call_ms"] = (time.perf_counter() - start) * 1000
+                    stage = "validation"
                     row["correctness"] = compare(
                         value, reference_for_backend, data, args.rtol, args.atol
                     )
@@ -648,6 +760,7 @@ def main(argv=None):
                     else:
                         del value
                         value = None
+                        stage = "timing"
                         row["timing"] = benchmark(
                             fn, device, args.warmup, args.iterations, args.repeats
                         )
@@ -668,7 +781,10 @@ def main(argv=None):
                 except Exception as exc:
                     failed = True
                     row["error"] = f"{type(exc).__name__}: {exc}"
+                    row["error_stage"] = stage
+                    row["traceback"] = traceback.format_exc()
                     print(f"  {name}: ERROR {row['error']}", flush=True)
+                    print(row["traceback"], flush=True)
                 finally:
                     report["results"].append(row)
                     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -684,6 +800,21 @@ def main(argv=None):
             if r["quant"] == quant and r["status"] == "PASS"
         ]
         gems = next((r for r in rows if r["backend"] == "gems"), None)
+        compiled = next(
+            (r for r in rows if r["backend"] == "torch_compile_chunked_fp32"), None
+        )
+        if gems and compiled:
+            speedup = (
+                compiled["timing"]["wall_us_median"] / gems["timing"]["wall_us_median"]
+            )
+            report.setdefault("comparisons", []).append(
+                {
+                    "quant": quant,
+                    "gems_speedup_vs_torch_compile": speedup,
+                    "definition": "compile wall time / Gems wall time; >1 means Gems is faster",
+                }
+            )
+            print(f"{quant} Gems speedup vs torch.compile: {speedup:.4f}x", flush=True)
         if gems:
             for row in rows:
                 ratio = (
@@ -702,7 +833,7 @@ def main(argv=None):
     args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
     print(f"\nSaved {args.output.resolve()}", flush=True)
     print(
-        "PASS means valid-region numerical check passed, not native 95% acceptance.",
+        "PASS means valid-region numerical check passed. Speedup >1 means Gems is faster.",
         flush=True,
     )
     return 1 if failed else 0

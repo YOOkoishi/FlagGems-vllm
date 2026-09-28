@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Check native/Gems valid-logit semantics using exactly representable inputs.
+"""Check torch.compile/Gems valid logits against hand-computed exact answers.
 
 python tools/check_paged_mqa_equivalence.py
 python tools/check_paged_mqa_equivalence.py --cpu-only --output /tmp/mqa-fixtures.json
@@ -16,15 +16,17 @@ import argparse
 import json
 import os
 import sys
+import traceback
 from pathlib import Path
 
 import torch
 from benchmark_paged_mqa import (
     Inputs,
     compare,
+    compiler_preflight,
     decode_q,
     make_gems_call,
-    make_native_call,
+    make_torch_call,
     pack_cache,
     reference,
     synchronize,
@@ -174,6 +176,7 @@ def main():
     )
     parser.add_argument("--quant", choices=("fp8", "fp4", "both"), default="both")
     parser.add_argument("--op-file", type=Path)
+    parser.add_argument("--libdevice-path", type=Path)
     parser.add_argument(
         "--output", type=Path, default=Path("paged_mqa_equivalence.json")
     )
@@ -188,6 +191,11 @@ def main():
                 "Use the working CoreX container, or --cpu-only for fixtures only"
             )
         torch.cuda.set_device(device)
+        preflight = compiler_preflight("iluvatar", args.libdevice_path)
+        print(
+            "Compiler preflight: " + json.dumps(preflight, ensure_ascii=False),
+            flush=True,
+        )
     torch.set_float32_matmul_precision("highest")
     report = {
         "scope": "valid logits, next_n=1, H=64, D=128, exactly representable inputs",
@@ -226,52 +234,47 @@ def main():
                                 "Input packing/reference disagrees with the hand answer"
                             )
                         if not args.cpu_only:
-                            native, native_ref, native_info = make_native_call(data)
-                            # Check that native BF16 preparation preserves the answer.
-                            row["native_input_vs_hand_answer"] = compare(
-                                native_ref, expected, data, 0, 0
-                            )
-                            if not row["native_input_vs_hand_answer"]["passed"]:
-                                raise AssertionError(
-                                    "The fixture changed during BF16 preparation"
-                                )
-                            native_out = native()
+                            compiled = make_torch_call(data, 64, compiled=True)
+                            compiled_out = compiled()
                             synchronize(device)
                             gems, gems_info = make_gems_call(data, args.op_file)
                             gems_out = gems()
                             synchronize(device)
-                            row["native_implementation"] = native_info
+                            row["compiled_implementation"] = (
+                                "torch_compile_chunked_fp32"
+                            )
                             row["gems_implementation"] = gems_info
-                            row["native_vs_hand_answer"] = compare(
-                                native_out, expected, data, 0, 0
+                            row["torch_compile_vs_hand_answer"] = compare(
+                                compiled_out, expected, data, 0, 0
                             )
                             row["gems_vs_hand_answer"] = compare(
                                 gems_out, expected, data, 0, 0
                             )
-                            row["native_vs_gems"] = compare(
-                                native_out, gems_out, data, 0, 0
+                            row["torch_compile_vs_gems"] = compare(
+                                compiled_out, gems_out, data, 0, 0
                             )
                             checks = (
-                                "native_vs_hand_answer",
+                                "torch_compile_vs_hand_answer",
                                 "gems_vs_hand_answer",
-                                "native_vs_gems",
+                                "torch_compile_vs_gems",
                             )
                             if not all(row[key]["passed"] for key in checks):
                                 raise AssertionError(
-                                    "native/Gems/hand answer disagree; "
+                                    "torch.compile/Gems/hand answer disagree; "
                                     "inspect JSON error metrics"
                                 )
-                            del native, gems, native_out, gems_out, native_ref
+                            del compiled, gems, compiled_out, gems_out
                         row["status"] = "PASS"
                         scope = (
                             "CPU fixture only"
                             if args.cpu_only
-                            else "native = gems = hand answer"
+                            else "torch.compile = gems = hand answer"
                         )
                         print(f"PASS {name} ({scope})", flush=True)
                     except Exception as exc:
                         failed = True
                         row["error"] = f"{type(exc).__name__}: {exc}"
+                        row["traceback"] = traceback.format_exc()
                         print(f"ERROR {name}: {row['error']}", flush=True)
                     report["results"].append(row)
                     args.output.parent.mkdir(parents=True, exist_ok=True)

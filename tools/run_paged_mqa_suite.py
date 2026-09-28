@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Run a size matrix; each case keeps native/torch/compile/Gems sequential.
+"""Run a size matrix comparing torch.compile and Gems sequentially per case.
 
 python tools/run_paged_mqa_suite.py --preset core --devices 0 --output-dir results/before
 python tools/run_paged_mqa_suite.py --preset all --devices all --jobs 4 --output-dir results/sweep
 python tools/run_paged_mqa_suite.py --preset all --list-cases
+python tools/run_paged_mqa_suite.py --summarize-only results/before/summary.json
 
 Device IDs are Torch-visible IDs on THIS host, not physical board IDs.
 Parallel sweeps are screening runs. Recheck important timings with --jobs 1.
@@ -25,7 +26,9 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
+from html import escape
 from pathlib import Path
+from urllib.parse import quote
 
 GIB = 1024**3
 BENCHMARK = Path(__file__).with_name("benchmark_paged_mqa.py")
@@ -296,6 +299,8 @@ def command_for(job, device, args, output):
             cmd += ["--" + key.replace("_", "-"), str(c[key])]
     if args.op_file:
         cmd += ["--op-file", str(args.op_file.resolve())]
+    if args.libdevice_path:
+        cmd += ["--libdevice-path", str(args.libdevice_path.resolve())]
     return cmd
 
 
@@ -373,6 +378,12 @@ def execute(job, device, args, free_before):
             details = json.loads(output.read_text())
             row["environment"] = details.get("environment")
             row["results"] = details.get("results", [])
+            child_preflight = details.get("compiler_preflight") or {}
+            if child_preflight:
+                row["compiler_preflight"] = child_preflight
+            child_error = details.get("error") or child_preflight.get("error")
+            if child_error:
+                row["error"] = child_error
             expected = expected_backends(args)
             recorded = [result.get("backend") for result in row["results"]]
             if row["status"] == "PASS" and (
@@ -405,7 +416,7 @@ def execute(job, device, args, free_before):
                 {
                     "backend": name,
                     "status": "NOT_COMPLETED",
-                    "error": f"Case ended with {row['status']}",
+                    "error": row.get("error") or f"Case ended with {row['status']}",
                 }
             )
     row["elapsed_s"] = time.monotonic() - start
@@ -413,33 +424,146 @@ def execute(job, device, args, free_before):
     return row
 
 
-def save_summary(report, directory):
-    report["results"].sort(key=lambda r: r["id"])
-    (directory / "summary.json").write_text(
-        json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+def comparison_note(backends):
+    note = (
+        "Gems speedup vs torch.compile = compile wall time / Gems wall time; "
+        "values above 1 mean Gems is faster. Both backends must pass before "
+        "a speedup is reported."
     )
+    if "native" in backends:
+        note += (
+            " Optional native BF16 prepared inputs differ from the packed FP8/FP4 "
+            "API; native results are not a same-format 95% comparison."
+        )
+    return note
+
+
+def positive_time(result):
+    value = result.get("timing", {}).get("wall_us_median")
+    if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
+        return value
+    return None
+
+
+def compile_gems_speedup(run):
+    passing = {
+        result.get("backend"): result
+        for result in run.get("results", [])
+        if result.get("status") == "PASS"
+    }
+    compiled = passing.get("torch_compile_chunked_fp32")
+    gems = passing.get("gems")
+    if compiled is None or gems is None:
+        return None
+    # Older summary files may omit quant on backend rows; their enclosing case
+    # still identifies one shared input. Explicitly different formats cannot mix.
+    if (
+        compiled.get("quant") is not None
+        and gems.get("quant") is not None
+        and compiled["quant"] != gems["quant"]
+    ):
+        return None
+    compile_us, gems_us = positive_time(compiled), positive_time(gems)
+    if compile_us is None or gems_us is None:
+        return None
+    return compile_us / gems_us
+
+
+def markdown_cell(value):
+    return (
+        escape(str(value), quote=False)
+        .replace("|", "\\|")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\n", "<br>")
+    )
+
+
+def error_reason(run, result):
+    reason = result.get("error") or result.get("reason")
+    correctness = result.get("correctness") or {}
+    if not reason and correctness.get("passed") is False:
+        reason = correctness.get("reason") or (
+            f"Numerical check failed: {correctness.get('mismatched', '?')} / "
+            f"{correctness.get('elements', '?')} valid logits differ"
+        )
+    if not reason and result.get("status") != "PASS":
+        reason = run.get("error") or run.get("reason")
+    if not reason and run.get("status") != "PASS" and run.get("error"):
+        reason = f"Case: {run['error']}"
+    if not reason and result.get("status") not in ("PASS", None):
+        reason = "No error text in saved JSON; inspect the case log"
+    return markdown_cell(reason) if reason else "-"
+
+
+def case_log_link(run, directory):
+    raw = run.get("log")
+    if not raw:
+        return "-"
+    path = Path(raw)
+    # Prefer a local link when the result directory has been copied elsewhere.
+    if (directory / path.name).exists() or path.parent == directory.resolve():
+        target = path.name
+    else:
+        target = str(path)
+    return f"[log](<{quote(target, safe='/._-:')}>)"
+
+
+def save_summary(report, directory, write_json=True):
+    report["results"].sort(key=lambda r: r.get("id", ""))
+    backends = report.get("arguments", {}).get("backends")
+    if backends is None:
+        backends = {
+            result.get("backend")
+            for run in report["results"]
+            for result in run.get("results", [])
+        }
+    report["comparison"] = comparison_note(backends)
+    for run in report["results"]:
+        run.pop("gems_speedup_vs_torch_compile", None)
+        speedup = compile_gems_speedup(run)
+        if speedup is not None:
+            run["gems_speedup_vs_torch_compile"] = speedup
+    if write_json:
+        (directory / "summary.json").write_text(
+            json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+        )
     lines = [
         "**Paged MQA suite results**",
         "",
-        report["measurement_note"],
+        report.get("measurement_note", "Summary regenerated from saved case results."),
         "",
-        "| case | device | case status | backend | backend status | wall us | max abs error |",
-        "| --- | --- | --- | --- | --- | ---: | ---: |",
+        report["comparison"],
+        "",
+        "| case | device | case status | backend | backend status | wall us | "
+        "max abs error | Gems speedup vs compile | error / reason | log |",
+        "| --- | --- | --- | --- | --- | ---: | ---: | ---: | --- | --- |",
     ]
     for run in report["results"]:
-        for result in run.get("results") or [{"backend": "-", "status": run["status"]}]:
+        log_link = case_log_link(run, directory)
+        for result in run.get("results") or [
+            {"backend": "-", "status": run.get("status", "UNKNOWN")}
+        ]:
             wall = result.get("timing", {}).get("wall_us_median")
             error = result.get("correctness", {}).get("max_abs")
-            prefix = (
-                f"| {run['id']} | {run.get('device', '-')} | {run['status']} | "
-                f"{result['backend']} | {result['status']} | "
-            )
-            numbers = (
-                f"{wall:.3f} | {error:.6g} |"
-                if wall is not None and error is not None
-                else "- | - |"
-            )
-            lines.append(prefix + numbers)
+            speedup = run.get("gems_speedup_vs_torch_compile")
+            cells = [
+                markdown_cell(run.get("id", "-")),
+                markdown_cell(run.get("device", "-")),
+                markdown_cell(run.get("status", "UNKNOWN")),
+                markdown_cell(result.get("backend", "-")),
+                markdown_cell(result.get("status", "UNKNOWN")),
+                f"{wall:.3f}" if isinstance(wall, (int, float)) else "-",
+                f"{error:.6g}" if isinstance(error, (int, float)) else "-",
+                (
+                    f"{speedup:.3f}x"
+                    if speedup is not None and result.get("backend") == "gems"
+                    else "-"
+                ),
+                error_reason(run, result),
+                log_link,
+            ]
+            lines.append("| " + " | ".join(cells) + " |")
     (directory / "summary.md").write_text("\n".join(lines) + "\n")
 
 
@@ -462,16 +586,21 @@ def parse_args():
     p.add_argument("--jobs", type=int, default=1)
     p.add_argument("--quant", choices=("fp8", "fp4", "both"), default="both")
     p.add_argument(
-        "--torch-mode", choices=("eager", "compile", "both"), default="eager"
+        "--torch-mode", choices=("eager", "compile", "both"), default="compile"
     )
     p.add_argument(
         "--backends",
         choices=("native", "torch", "gems"),
         nargs="+",
-        default=["native", "torch", "gems"],
+        default=["torch", "gems"],
     )
     p.add_argument("--vendor", default="iluvatar")
     p.add_argument("--op-file", type=Path)
+    p.add_argument(
+        "--libdevice-path",
+        type=Path,
+        help="explicit SDK libdevice bitcode path passed to the benchmark",
+    )
     p.add_argument("--chunk-tokens", type=int, default=512)
     p.add_argument("--warmup", type=int)
     p.add_argument("--iterations", type=int)
@@ -494,6 +623,11 @@ def parse_args():
     p.add_argument("--atol", type=float, default=0.05)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--output-dir", type=Path, default=Path("paged_mqa_suite"))
+    p.add_argument(
+        "--summarize-only",
+        type=Path,
+        help="existing summary.json or suite directory; regenerate summary.md only, without GPU",
+    )
     p.add_argument(
         "--list-cases",
         action="store_true",
@@ -519,6 +653,16 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.summarize_only:
+        source = args.summarize_only
+        if source.is_dir():
+            source = source / "summary.json"
+        report = json.loads(source.read_text())
+        if not isinstance(report, dict) or not isinstance(report.get("results"), list):
+            raise ValueError("--summarize-only requires a suite summary JSON object")
+        save_summary(report, source.parent, write_json=False)
+        print(f"Saved {(source.parent / 'summary.md').resolve()}")
+        return 0
     cases = (
         json.loads(args.cases_file.read_text())
         if args.cases_file
@@ -550,6 +694,23 @@ def main():
         raise ValueError(
             "Use a new/empty --output-dir; existing baseline results are not overwritten"
         )
+    preflight = {"status": "SKIPPED", "reason": "No GPU compiler backend selected"}
+    needs_compiler = "gems" in args.backends or (
+        "torch" in args.backends and args.torch_mode in ("compile", "both")
+    )
+    if args.devices != "cpu" and needs_compiler:
+        try:
+            from benchmark_paged_mqa import compiler_preflight
+
+            preflight = compiler_preflight(args.vendor, args.libdevice_path)
+        except Exception as exc:
+            print(
+                f"Compiler preflight failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
+        print(json.dumps({"compiler_preflight": preflight}, indent=2), flush=True)
     devices = inventory(args.devices)
     workers = min(args.jobs, len(devices))
     available_host = host_available_memory()
@@ -580,6 +741,7 @@ def main():
         "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "host_available_before": available_host,
         "host_budget": host_budget,
+        "compiler_preflight": preflight,
         "arguments": {
             k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
         },
@@ -588,7 +750,7 @@ def main():
             if workers > 1
             else "Serial size sweep; each case uses one device and sequential backends."
         ),
-        "comparison": "Native BF16 prepared inputs differ from the packed FP8/FP4 API; no same-format 95% claim.",
+        "comparison": comparison_note(args.backends),
         "results": [],
     }
     print(
