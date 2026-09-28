@@ -1,5 +1,9 @@
 **一个大任务，多卡共同计算：Paged MQA**
 
+需要一次覆盖五档尺寸、普通版和分页版，并比较 Torch / 原始 Gems / TLE 候选，
+使用新的[统一测试入口](benchmark_mqa_suite.md)。本文件对应原来的单 shape、
+仅 paged、两方比较入口。
+
 原来的 `run_paged_mqa_suite.py --jobs 16` 是16张卡独立跑不同case，不包含卡间协作。这个新脚本把同一批请求的KV长度维分给多个rank，共用Q/weights，再通过collective通信拼回完整logits。
 
 生产kernel没有修改；测试的是现有单卡kernel加分片和通信编排后的性能。默认仍只比较 torch.compile 和 Gems，不运行native。
