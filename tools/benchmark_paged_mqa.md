@@ -1,5 +1,7 @@
 **Paged MQA：torch.compile 与 Gems 对比**
 
+如需“同一个大任务由多卡协作”，使用新增的 [分布式测试说明](/home/yoo/Documents/AIC/FlagGems-vllm/tools/benchmark_paged_mqa_distributed.md)：按KV长度分片、广播Q、汇总logits。下面suite的多卡模式仍是各卡独立测不同case。
+
 当前默认只运行 `torch_compile_chunked_fp32 → gems`。不导入或调用 IxFormer 算子；native 保留为显式 opt-in 的历史诊断入口。`torch_fp32` 是 eager 名称，不能把旧 summary 的这一行当作 torch.compile。
 
 **先修好编译路径，再跑一个小 case**
