@@ -22,6 +22,7 @@ import inspect
 import json
 import math
 import os
+import socket
 import statistics
 import subprocess
 import sys
@@ -108,10 +109,17 @@ def make_inputs(args, quant, device):
         shifts = torch.arange(4, dtype=torch.int64) * 8
         q_scale = (scale_codes << shifts).sum(-1).to(torch.int32)
 
-    k = torch.randn((pages, args.page_size, dim), generator=rng)
-    scales = k.abs().amax(-1).clamp_min(1e-4) / 448.0
-    k_fp8 = (k / scales[..., None]).to(torch.float8_e4m3fn)
-    cache = pack_cache(k_fp8, scales)
+    # Bound host temporaries: large cases must not materialize the whole FP32 K.
+    cache = torch.empty((pages, args.page_size, 1, dim + 4), dtype=torch.uint8)
+    pages_per_chunk = max(1, 65536 // args.page_size)
+    for first in range(0, pages, pages_per_chunk):
+        count = min(pages_per_chunk, pages - first)
+        k = torch.randn((count, args.page_size, dim), generator=rng)
+        scales = k.abs().amax(-1).clamp_min(1e-4) / 448.0
+        k.div_(scales[..., None])
+        k_fp8 = k.to(torch.float8_e4m3fn)
+        cache[first : first + count] = pack_cache(k_fp8, scales)
+    del k, scales, k_fp8
     weights = torch.randn((batch, heads), generator=rng) / math.sqrt(heads)
     tables = torch.zeros((batch, math.ceil(width / args.page_size)), dtype=torch.int32)
     physical_ids = torch.randperm(pages, generator=rng).to(torch.int32)
@@ -205,8 +213,19 @@ def make_native_call(data):
     native_ops = importlib.import_module("ixformer.inference.functions")
     fn = native_ops.dsa_indexer_mqa_logits_with_blocks
     q = decode_q(data.q, data.q_scale).to(torch.bfloat16).contiguous()
-    k, scales = unpack_cache(data.cache)
-    k = (k * scales[..., None]).to(torch.bfloat16).contiguous()
+    # Preparation is outside timing. Convert pages in chunks to avoid full-size
+    # FP32 decode + scaled FP32 + BF16 buffers existing at the same time.
+    pages, page, _, packed_dim = data.cache.shape
+    k = torch.empty(
+        (pages, page, packed_dim - 4), device=q.device, dtype=torch.bfloat16
+    )
+    pages_per_chunk = max(1, 65536 // page)
+    for first in range(0, pages, pages_per_chunk):
+        end = min(first + pages_per_chunk, pages)
+        values, scales = unpack_cache(data.cache[first:end])
+        values.mul_(scales[..., None])
+        k[first:end].copy_(values)
+    del values, scales
     weights = data.weights.to(torch.bfloat16).contiguous()
     batch = q.shape[0]
     cu_q = torch.arange(batch + 1, dtype=torch.int32, device=q.device)
@@ -246,7 +265,7 @@ def make_native_call(data):
 
     native_ref = reference(
         q.float(),
-        k.float(),
+        k,
         torch.ones(k.shape[:2], device=q.device),
         weights.float(),
         data,
@@ -329,6 +348,10 @@ def benchmark(fn, device, warmup, iterations, repeats):
         value = fn()
         del value
     synchronize(device)
+    allocated_before = None
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+        allocated_before = torch.cuda.memory_allocated(device)
     wall_samples, device_samples = [], []
     for _ in range(repeats):
         synchronize(device)
@@ -358,6 +381,13 @@ def benchmark(fn, device, warmup, iterations, repeats):
         "warmup_calls": warmup,
         "iterations_per_repeat": iterations,
         "repeats": repeats,
+        "torch_memory_allocated_before_bytes": allocated_before,
+        "torch_peak_memory_allocated_bytes": (
+            torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None
+        ),
+        "torch_peak_memory_reserved_bytes": (
+            torch.cuda.max_memory_reserved(device) if device.type == "cuda" else None
+        ),
     }
 
 
@@ -382,17 +412,27 @@ def environment(device):
         commit = None
     return {
         "python": sys.version,
+        "hostname": socket.gethostname(),
+        "pid": os.getpid(),
         "packages": versions,
         "device": str(device),
         "device_name": (
             torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
         ),
+        "device_total_memory_bytes": (
+            torch.cuda.get_device_properties(device).total_memory
+            if device.type == "cuda"
+            else None
+        ),
+        "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "torch_cuda_build": torch.version.cuda,
         "repo_commit": commit,
         "benchmark_script_sha256": hashlib.sha256(
             Path(__file__).read_bytes()
         ).hexdigest(),
         "GEMS_VENDOR": os.environ.get("GEMS_VENDOR"),
+        "TRITON_LIBDEVICE_PATH": os.environ.get("TRITON_LIBDEVICE_PATH"),
+        "TRITON_LIBCUDA_PATH": os.environ.get("TRITON_LIBCUDA_PATH"),
         "FLAGGEMS_FP8_FP4_PAGED_MQA_LOGITS_TLE": os.environ.get(
             "FLAGGEMS_FP8_FP4_PAGED_MQA_LOGITS_TLE"
         ),
@@ -462,8 +502,10 @@ def parse_args(argv=None):
     for name in ("batch", "context", "chunk_tokens", "iterations", "repeats"):
         if getattr(args, name) <= 0:
             p.error(f"--{name.replace('_', '-')} must be positive")
-    if args.warmup < 0 or args.rtol < 0 or args.atol < 0:
-        p.error("warmup and tolerances must be nonnegative")
+    if args.warmup < 0 or not all(
+        math.isfinite(value) and value >= 0 for value in (args.rtol, args.atol)
+    ):
+        p.error("warmup must be nonnegative; tolerances must be finite and nonnegative")
     if args.contexts is not None and (not args.contexts or min(args.contexts) <= 0):
         p.error("--contexts must contain positive lengths")
     for name in ("max_model_len", "cache_pages"):

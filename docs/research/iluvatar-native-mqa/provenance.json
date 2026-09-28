@@ -1,0 +1,25 @@
+{
+  "retrieved_on": "2026-09-24",
+  "image": "registry.iluvatar.com.cn:10443/k8s/vllm:corex450-rc12-dsv4-flash-w4a8-bnxt239",
+  "manifest_sha256": "bd59eaaab871658ed01c70fa00945afcb18029d6c0ad1d139a9c9e4ca83fa20e",
+  "config_digest": "sha256:68aaf1cd17b802976135ee5eca40d82ee5fdc086dcc41519e03699fdbbe38e07",
+  "source_layer_digest": "sha256:16d03d43cc91df79334b06d9628a545f651817ec06e5690a796e29e804ff4266",
+  "installed_layer_digest": "sha256:d3569ab5d73ba3236a63ef16c823ba9ee71a9eaf3241da646911352b62d174f9",
+  "ixformer_version_in_build_history": "0.7.0+corex.4.5.0.rc.12.20260722",
+  "vllm_version_in_build_history": "0.25.1+corex.4.5.0.rc.12.20260722",
+  "vllm_iluvatar_version_in_metadata": "0.1.0",
+  "vllm_iluvatar_commit_in_build_history": "4c6c93349991e9dc034ebaac4a69c90cb3b13c18",
+  "verification": "Public registry anonymous pull; extracted text files only; downloaded layer sha256 checked; no package installation or GPU execution.",
+  "files": [
+    {
+      "snapshot": "ilu_deepseek_v4_attention.py.txt",
+      "path_in_image": "/usr/local/lib/python3.12/site-packages/vllm_iluvatar/layers/ilu_deepseek_v4_attention.py",
+      "sha256": "9cb72604bfac6903136346d5fdaeecb5c227de725287bd22e443e8c3f859b5af"
+    },
+    {
+      "snapshot": "ilu_sparse_attn_indexer.py.txt",
+      "path_in_image": "/usr/local/lib/python3.12/site-packages/vllm_iluvatar/_vllm_overrides/vllm/model_executor/layers/ilu_sparse_attn_indexer.py",
+      "sha256": "7e77cfc6d12774f2ffb91f8c65593bed2e1072dc54ffe2eb677f8fd902a4c1df"
+    }
+  ]
+}
