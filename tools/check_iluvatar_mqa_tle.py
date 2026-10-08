@@ -59,6 +59,21 @@ def progress(message):
     print(f"[MQA] {message}", flush=True)
 
 
+def transfer_tensor(value, device, fp8_transfer):
+    """Move fixture data; the byte path preserves FP8 encodings exactly.
+
+    This is a selectable diagnostic for typed FP8 host-to-device copies, not a
+    workaround for general device failures. It is never included in op timing.
+    """
+    if (
+        fp8_transfer == "bytes"
+        and value.device.type == "cpu"
+        and value.dtype == torch.float8_e4m3fn
+    ):
+        return value.view(torch.uint8).to(device).view(value.dtype)
+    return value.to(device)
+
+
 @dataclass
 class Case:
     name: str
@@ -68,19 +83,28 @@ class Case:
     computed: torch.Tensor
     invalid_fill: float
 
-    def on_device(self, device):
-        def move(value):
+    def on_device(self, device, fp8_transfer="direct"):
+        def move(value, name):
             if isinstance(value, torch.Tensor):
-                return value.to(device)
+                progress(
+                    f"{self.name}: transfer {name} {tuple(value.shape)} "
+                    f"{value.dtype} {value.device}->{device} begin "
+                    f"(fp8_transfer={fp8_transfer})"
+                )
+                result = transfer_tensor(value, device, fp8_transfer)
+                progress(f"{self.name}: transfer {name} returned")
+                return result
             if isinstance(value, tuple):
-                return tuple(move(item) for item in value)
+                return tuple(
+                    move(item, f"{name}[{index}]") for index, item in enumerate(value)
+                )
             return value
 
         return replace(
             self,
-            kwargs={key: move(value) for key, value in self.kwargs.items()},
-            expected=self.expected.to(device),
-            computed=self.computed.to(device),
+            kwargs={key: move(value, key) for key, value in self.kwargs.items()},
+            expected=move(self.expected, "expected"),
+            computed=move(self.computed, "computed_mask"),
         )
 
 
@@ -324,13 +348,17 @@ def observed_call(module, fn):
     return value, calls
 
 
-def validate_host_contract(functions, device):
+def validate_host_contract(functions, device, fp8_transfer="direct"):
     """Empty output and rejected formats must not reach the TLE launcher."""
     results = []
     for operator, (fn, module) in functions.items():
         progress(f"{operator}: preparing empty/unsupported-input checks")
         if operator == "dense":
-            base = dense_fixture("fp8", 1, 16, 67, True).on_device(device).kwargs
+            base = (
+                dense_fixture("fp8", 1, 16, 67, True)
+                .on_device(device, fp8_transfer)
+                .kwargs
+            )
             empty_rows = dict(base)
             empty_rows["q"] = (base["q"][0][:0], None)
             for name in ("weights", "cu_seqlen_ks", "cu_seqlen_ke"):
@@ -346,7 +374,11 @@ def validate_host_contract(functions, device):
             unsupported_dim["kv"] = (base["kv"][0][:, :64], base["kv"][1])
             rejects = [("D64", unsupported_dim)]
         else:
-            base = paged_fixture("fp8", 16, 16, 2, 2, True).on_device(device).kwargs
+            base = (
+                paged_fixture("fp8", 16, 16, 2, 2, True)
+                .on_device(device, fp8_transfer)
+                .kwargs
+            )
             empty_rows = dict(base)
             empty_rows["q"] = (base["q"][0][:0], None)
             for name in ("weights", "context_lens", "block_tables"):
@@ -465,6 +497,12 @@ def parse_args(argv=None):
     )
     parser.add_argument("--quick", action="store_true", help="Omit H=1 cases")
     parser.add_argument("--bench", action="store_true")
+    parser.add_argument(
+        "--fp8-transfer",
+        choices=("direct", "bytes"),
+        default="direct",
+        help="Fixture copies only: use typed FP8 transfer or preserve bytes via uint8",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=5)
@@ -507,6 +545,7 @@ def main(argv=None):
         "kernel_validation_completed": False,
         "rtol": args.rtol,
         "atol": args.atol,
+        "fp8_transfer": args.fp8_transfer,
         "benchmark_scope": "same candidate algorithm, independently autotuned plain/TLE",
         "cases": [],
     }
@@ -518,7 +557,7 @@ def main(argv=None):
             if not args.cpu_only:
                 progress("Checking empty/unsupported inputs before kernel tests")
                 report["host_contract_checks"] = validate_host_contract(
-                    functions, device
+                    functions, device, args.fp8_transfer
                 )
             progress("Generating fixtures and starting correctness checks")
             for fixture in fixtures(args):
@@ -532,7 +571,10 @@ def main(argv=None):
                     row["status"] = "CPU_FIXTURE_REFERENCE_PASS"
                 else:
                     row["checks"] = validate_case(
-                        fixture.on_device(device), functions, args, device
+                        fixture.on_device(device, args.fp8_transfer),
+                        functions,
+                        args,
+                        device,
                     )
                     row["status"] = "KERNEL_PASS"
         report["status"] = "CPU_FIXTURES_ONLY" if args.cpu_only else "KERNEL_PASS"
