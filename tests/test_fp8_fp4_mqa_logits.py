@@ -26,10 +26,15 @@ except ImportError:
     VLLM_AVAILABLE = False
     SM90_AVAILABLE = False
 
-from vllm.third_party.deep_gemm.utils.math import (
-    cast_back_from_fp4,
-    per_token_cast_to_fp4,
-)
+try:
+    from vllm.third_party.deep_gemm.utils.math import (
+        cast_back_from_fp4,
+        per_token_cast_to_fp4,
+    )
+
+    FP4_QUANT_AVAILABLE = True
+except ImportError:
+    FP4_QUANT_AVAILABLE = False
 
 import flaggems_vllm
 from flaggems_vllm.ops.fp8_fp4_mqa_logits import fp8_fp4_mqa_logits
@@ -191,7 +196,14 @@ def _build_inputs(M, N, device, use_fp4=False):
 )
 @pytest.mark.parametrize("clean_logits", [True, False])
 @pytest.mark.parametrize("use_fp4", [False, True])
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "iluvatar",
+    reason="Iluvatar native MQA reference is not integrated; use tools/benchmark_mqa_suite.py",
+)
 def test_fp8_fp4_mqa_logits(M, N, clean_logits, use_fp4):
+    if use_fp4 and not FP4_QUANT_AVAILABLE:
+        pytest.skip("requires vLLM FP4 quantization helpers")
+
     q_values, q_scale, k_fp8, k_scale, weights, ks, ke = _build_inputs(
         M, N, device, use_fp4=use_fp4
     )

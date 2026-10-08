@@ -80,6 +80,7 @@ class FP8FP4MQALogitsBenchmark(base.Benchmark):
         self.shapes = [
             (M, N, use_fp4) for use_fp4 in (False, True) for (M, N) in BENCH_SHAPES
         ]
+        self.shapes = [shape for shape in self.shapes if shape[-1] == self.use_fp4]
 
     def get_input_iter(self, dtype):
         for M, N, use_fp4 in self.shapes:
@@ -91,8 +92,7 @@ class FP8FP4MQALogitsBenchmark(base.Benchmark):
 
 def _vllm_wrapper(q_values, q_scale, k_fp8, k_scale, weights, ks, ke, use_fp4):
     if use_fp4:
-        # vLLM doesn't support FP4, skip
-        return None
+        raise NotImplementedError("FP4 native baseline is not implemented here")
     return vllm_fp8_fp4_mqa_logits(
         q=(q_values, None),
         kv=(k_fp8, k_scale),
@@ -125,11 +125,22 @@ def _gems_wrapper(q_values, q_scale, k_fp8, k_scale, weights, ks, ke, use_fp4):
     reason="requires vLLM with DeepGEMM and FP8 quantization support",
 )
 @pytest.mark.fp8_fp4_mqa_logits
-def test_fp8_fp4_mqa_logits():
+@pytest.mark.parametrize("use_fp4", [False, True], ids=["fp8", "fp4"])
+@pytest.mark.skipif(
+    base.vendor_name == "iluvatar",
+    reason=(
+        "Native MQA reference is not integrated for Iluvatar; "
+        "use tools/benchmark_mqa_suite.py"
+    ),
+)
+def test_fp8_fp4_mqa_logits(use_fp4):
+    if use_fp4:
+        pytest.skip("FP4 native baseline is not implemented in this benchmark")
     bench = FP8FP4MQALogitsBenchmark(
         op_name="fp8_fp4_mqa_logits",
         torch_op=_vllm_wrapper,
         gems_op=_gems_wrapper,
         dtypes=[torch.bfloat16],
     )
+    bench.use_fp4 = use_fp4
     bench.run()

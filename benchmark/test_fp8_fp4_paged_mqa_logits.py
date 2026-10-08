@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from flaggems_vllm.ops import fp8_fp4_paged_mqa_logits
-from tests.test_fp8_fp4_mqa_logits import quantize_to_mxfp4
+from tests.test_fp8_fp4_mqa_logits import FP4_QUANT_AVAILABLE, quantize_to_mxfp4
 
 from . import base
 
@@ -163,6 +163,7 @@ class Fp8Fp4PagedMqaLogitsBenchmark(base.Benchmark):
         self.shapes = [
             (bs, nn, kv, fp4) for fp4 in (False, True) for (bs, nn, kv) in BENCH_SHAPES
         ]
+        self.shapes = [shape for shape in self.shapes if shape[-1] == self.use_fp4]
 
     def get_input_iter(self, dtype):
         device = self.device
@@ -185,11 +186,27 @@ class Fp8Fp4PagedMqaLogitsBenchmark(base.Benchmark):
 
 @pytest.mark.fp8_fp4_paged_mqa_logits
 @pytest.mark.skipif(not _HAS_VLLM, reason="vLLM not available")
-def test_fp8_fp4_paged_mqa_logits():
+@pytest.mark.parametrize("use_fp4", [False, True], ids=["fp8", "fp4"])
+@pytest.mark.skipif(
+    base.vendor_name == "iluvatar",
+    reason=(
+        "Native paged MQA reference is not integrated for Iluvatar; "
+        "use tools/benchmark_mqa_suite.py"
+    ),
+)
+def test_fp8_fp4_paged_mqa_logits(use_fp4):
+    if use_fp4:
+        if not FP4_QUANT_AVAILABLE:
+            pytest.skip("requires vLLM FP4 quantization helpers")
+        if base.vendor_name == "nvidia" and (
+            not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 12
+        ):
+            pytest.skip("FP4 paged DeepGEMM requires SM120+")
     bench = Fp8Fp4PagedMqaLogitsBenchmark(
         op_name="fp8_fp4_paged_mqa_logits",
         torch_op=_baseline_fn,
         gems_op=_gems_fn,
         dtypes=[torch.float32],
     )
+    bench.use_fp4 = use_fp4
     bench.run()

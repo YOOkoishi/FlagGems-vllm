@@ -13,6 +13,7 @@ import csv
 import gc
 import hashlib
 import importlib
+import inspect
 import json
 import math
 import os
@@ -120,6 +121,66 @@ def harness_hashes():
             "run_paged_mqa_suite.py",
         )
     }
+
+
+def load_frozen_operator(operator, directory, manifest):
+    """Resolve the public vendor dispatch and verify its frozen source provenance."""
+    package_root = (Path(directory) / "src" / "flaggems_vllm").resolve()
+
+    def verified_file(filename, label):
+        if not filename:
+            raise RuntimeError(f"Cannot verify {label}: no source file")
+        path = Path(filename).resolve()
+        try:
+            relative = str(path.relative_to(package_root))
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Imported {label} from {path}, outside frozen source {package_root}"
+            ) from exc
+        expected = manifest["files"].get(relative)
+        if (
+            expected is None
+            or not path.is_file()
+            or digest(path.read_bytes()) != expected
+        ):
+            raise RuntimeError(f"Imported {label} does not match frozen source: {path}")
+        return path
+
+    package = importlib.import_module("flaggems_vllm")
+    verified_file(getattr(package, "__file__", None), "public package")
+    name = OPS[operator]
+    fn = getattr(package, name, None)
+    if not callable(fn):
+        raise RuntimeError(f"Public operator flaggems_vllm.{name} is not callable")
+    module_name = getattr(fn, "__module__", "")
+    if not module_name.startswith("flaggems_vllm."):
+        raise RuntimeError(
+            f"Public operator {name} has unexpected module {module_name!r}"
+        )
+    module = importlib.import_module(module_name)
+    module_file = verified_file(getattr(module, "__file__", None), "operator module")
+    try:
+        filename = inspect.getsourcefile(fn)
+    except TypeError as exc:
+        raise RuntimeError(f"Cannot verify source of public operator {name}") from exc
+    function_file = verified_file(filename, "operator function")
+    if function_file != module_file:
+        raise RuntimeError(
+            f"Public operator {name} source {function_file} "
+            f"differs from its module {module_file}"
+        )
+    return (
+        package,
+        module,
+        {
+            "public_operator": f"flaggems_vllm.{name}",
+            "module": module_name,
+            "file": str(module_file),
+            "sha256": digest(module_file.read_bytes()),
+            "function_file": str(function_file),
+            "package_tree_sha256": manifest["tree_sha256"],
+        },
+    )
 
 
 def parse_shapes(values):
@@ -840,24 +901,13 @@ def run_worker(spec):
         dist.destroy_process_group()
         return 0
 
-    module = None
+    package = module = None
     if backend != "torch":
-        module = importlib.import_module(f"flaggems_vllm.ops.{OPS[operator]}")
-        expected_file = (
-            Path(spec["source"]["directory"])
-            / "src"
-            / "flaggems_vllm"
-            / "ops"
-            / f"{OPS[operator]}.py"
+        package, module, implementation = load_frozen_operator(
+            operator, spec["source"]["directory"], source_manifest
         )
-        if Path(module.__file__).resolve() != expected_file.resolve():
-            raise RuntimeError(
-                f"Imported {module.__file__}, expected frozen source {expected_file}"
-            )
         report["implementation"] = {
-            "file": str(expected_file),
-            "sha256": digest(expected_file.read_bytes()),
-            "package_tree_sha256": source_manifest["tree_sha256"],
+            **implementation,
             "tle_environment": {flag: os.environ[flag] for flag in TLE_FLAGS},
             "tle_launcher": getattr(args, f"{operator}_tle_launcher"),
             "tle_evidence_scope": "host launcher observed during untimed validation; not an instruction-level profiler",
@@ -912,7 +962,7 @@ def run_worker(spec):
                     data, args.chunk_tokens, compiled=args.torch_mode == "compile"
                 )
             else:
-                fn = make_operator_call(module, operator, data)
+                fn = make_operator_call(package, operator, data)
             if rank == 0:
                 print(
                     f"{operator} {quant} {backend}: compiling and checking ...",

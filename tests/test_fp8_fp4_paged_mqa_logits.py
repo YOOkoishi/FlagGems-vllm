@@ -19,7 +19,11 @@ import flaggems_vllm
 from flaggems_vllm.ops import fp8_fp4_paged_mqa_logits
 
 from .accuracy_utils import gems_assert_close
-from .test_fp8_fp4_mqa_logits import quantize_to_mxfp4, reference_fp4_mqa_logits
+from .test_fp8_fp4_mqa_logits import (
+    FP4_QUANT_AVAILABLE,
+    quantize_to_mxfp4,
+    reference_fp4_mqa_logits,
+)
 
 device = flaggems_vllm.device
 
@@ -166,7 +170,14 @@ def _reference_fn(q_fp8, kv_fp8, weights, context_lens, block_table):
 )
 @pytest.mark.parametrize("use_fp4", [False, True])
 @pytest.mark.skipif(not _HAS_VLLM, reason="vLLM not available")
+@pytest.mark.skipif(
+    flaggems_vllm.vendor_name == "iluvatar",
+    reason="Iluvatar native MQA reference is not integrated; use tools/benchmark_mqa_suite.py",
+)
 def test_fp8_fp4_paged_mqa_logits(batch_size, next_n, avg_kv, use_fp4):
+    if use_fp4 and not FP4_QUANT_AVAILABLE:
+        pytest.skip("requires vLLM FP4 quantization helpers")
+
     torch.manual_seed(0)
     q_packed, q_scale, kv_fp8, weights, context_lens, block_table = _make_inputs(
         batch_size, next_n, avg_kv, use_fp4=use_fp4

@@ -9,7 +9,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -23,6 +24,45 @@ def passed_row(value=2.0, signature="same"):
         "comparison_signature": signature,
         "timing": {p: {"critical_ms_median": value} for p in suite.PHASES},
     }
+
+
+def fake_operator_snapshot(root, vendor):
+    """Model top-level runtime replacement without importing Torch or Triton."""
+    package = root / "source" / "flaggems_vllm"
+    (package / "ops").mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    for name in suite.OPS.values():
+        (package / "ops" / f"{name}.py").write_text(
+            f"def {name}(*args, **kwargs):\n    return 'generic'\n"
+        )
+        if vendor:
+            vendor_dir = package / "runtime" / "backend" / "_iluvatar" / "fused"
+            vendor_dir.mkdir(parents=True, exist_ok=True)
+            (vendor_dir / f"{name}.py").write_text(
+                "def _launch_tle_kernel(*args, **kwargs):\n    return 'vendor'\n"
+                f"def {name}(*args, **kwargs):\n"
+                "    return _launch_tle_kernel(*args, **kwargs)\n"
+            )
+    directory = root / "frozen"
+    manifest = suite.freeze_source(package.parent, directory)
+    frozen_package = directory / "src" / "flaggems_vllm"
+    public = ModuleType("flaggems_vllm")
+    public.__file__ = str(frozen_package / "__init__.py")
+    public.__path__ = [str(frozen_package)]
+    modules = {public.__name__: public}
+    prefixes = ["ops"]
+    if vendor:
+        prefixes.append("runtime.backend._iluvatar.fused")
+    for prefix in prefixes:
+        for name in suite.OPS.values():
+            module_name = f"flaggems_vllm.{prefix}.{name}"
+            module = ModuleType(module_name)
+            path = frozen_package.joinpath(*prefix.split("."), f"{name}.py")
+            module.__file__ = str(path)
+            exec(compile(path.read_text(), str(path), "exec"), module.__dict__)
+            modules[module_name] = module
+            setattr(public, name, getattr(module, name))
+    return directory, manifest, modules
 
 
 class SourceAndReportingTests(unittest.TestCase):
@@ -76,6 +116,84 @@ class SourceAndReportingTests(unittest.TestCase):
             copied.write_text("block: 128\n")
             with self.assertRaisesRegex(ValueError, "modified"):
                 suite.verify_snapshot(frozen)
+
+    def test_public_vendor_operator_and_its_actual_launcher_are_selected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory, manifest, modules = fake_operator_snapshot(
+                Path(tmp), vendor=True
+            )
+            with patch.dict(sys.modules, modules):
+                for operator, name in suite.OPS.items():
+                    with self.subTest(operator=operator):
+                        public, module, info = suite.load_frozen_operator(
+                            operator, directory, manifest
+                        )
+                        fn = getattr(public, name)
+                        self.assertIs(public, modules["flaggems_vllm"])
+                        self.assertIsNot(
+                            fn, getattr(modules[f"flaggems_vllm.ops.{name}"], name)
+                        )
+                        self.assertEqual(
+                            suite.observed_call(module, "_launch_tle_kernel", fn),
+                            ("vendor", 1),
+                        )
+                        self.assertEqual(info["module"], fn.__module__)
+                        self.assertEqual(info["file"], module.__file__)
+                        self.assertEqual(info["function_file"], module.__file__)
+                        self.assertEqual(
+                            info["sha256"],
+                            suite.digest(Path(module.__file__).read_bytes()),
+                        )
+
+    def test_frozen_baseline_without_vendor_override_keeps_generic_operator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory, manifest, modules = fake_operator_snapshot(
+                Path(tmp), vendor=False
+            )
+            with patch.dict(sys.modules, modules):
+                for operator, name in suite.OPS.items():
+                    public, module, info = suite.load_frozen_operator(
+                        operator, directory, manifest
+                    )
+                    self.assertIs(module, modules[f"flaggems_vllm.ops.{name}"])
+                    self.assertEqual(getattr(public, name)(), "generic")
+                    self.assertEqual(info["module"], module.__name__)
+
+    def test_operator_provenance_rejects_other_package_module_and_function(self):
+        for target in ("package", "module", "function"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                directory, manifest, modules = fake_operator_snapshot(root, vendor=True)
+                foreign = root / "installed_elsewhere.py"
+                foreign.write_text("def fp8_fp4_mqa_logits():\n    return 'foreign'\n")
+                public = modules["flaggems_vllm"]
+                fn = public.fp8_fp4_mqa_logits
+                module = modules[fn.__module__]
+                if target == "package":
+                    public.__file__ = str(foreign)
+                elif target == "module":
+                    module.__file__ = str(foreign)
+                else:
+                    namespace = {"__name__": module.__name__}
+                    exec(compile(foreign.read_text(), str(foreign), "exec"), namespace)
+                    public.fp8_fp4_mqa_logits = namespace["fp8_fp4_mqa_logits"]
+                with patch.dict(sys.modules, modules):
+                    with self.assertRaisesRegex(RuntimeError, "outside frozen source"):
+                        suite.load_frozen_operator("dense", directory, manifest)
+
+    def test_operator_provenance_rejects_changed_module_after_snapshot_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory, manifest, modules = fake_operator_snapshot(
+                Path(tmp), vendor=True
+            )
+            suite.verify_snapshot(directory)
+            module = modules[modules["flaggems_vllm"].fp8_fp4_mqa_logits.__module__]
+            Path(module.__file__).write_text("changed = True\n")
+            with patch.dict(sys.modules, modules):
+                with self.assertRaisesRegex(
+                    RuntimeError, "does not match frozen source"
+                ):
+                    suite.load_frozen_operator("dense", directory, manifest)
 
     def test_observed_launcher_and_restoration_after_exception(self):
         module = SimpleNamespace(launch=lambda: 42)

@@ -98,8 +98,33 @@ python tools/benchmark_mqa_suite.py \
 - `UNVERIFIED_TLE`：候选没有可观察的 launcher，不能确认 TLE 路径，不生成耗时比较。
 - `BASELINE_USED_TLE`：原始版关闭开关后仍调用了 TLE launcher，视为错误。
 
-当前仓库已有 TLE 路径针对 NVIDIA 的 WGMMA/TMA，而且有尺寸限制；仅把环境
-变量设为 1 不会让它变成天数 TLE 实现。天数候选实现需由后续优化工作提供。
+通用算子内的 TLE 路径针对 NVIDIA 的 WGMMA/TMA，而且有尺寸限制。天数候选
+位于 `runtime/backend/_iluvatar/fused/`，使用 `gpu.alloc/local_ptr` 做同步
+FP16 shared staging，尚未通过天数真机验收，默认不替换通用实现。
+在**导入包之前**设置以下开关，才会启用两个天数候选的顶层 API：
+
+```bash
+export FLAGGEMS_ILUVATAR_MQA_EXPERIMENTAL=1
+```
+
+脚本现在调用 `flaggems_vllm.<op>`，并从公开函数的 `__module__` 找到实际
+launcher；报告中的 `implementation.module/file` 会记录真正执行的厂商模块。
+直接导入 `flaggems_vllm.ops.<op>` 会绕过厂商替换，不应用它验证此候选。
+修改前冻结的 baseline 不包含此候选，在同一开关下仍执行原始实现。
+
+候选先覆盖 D=128、H=1..64、FP8/MXFP4 Q，paged 支持 page=16/32/64/128/256
+及 `[B]` / `[B,next_n]` context lengths。先在已配置好的天数环境运行：
+
+```bash
+python tools/check_iluvatar_mqa_tle.py --bench --output /tmp/mqa-tle-check.json
+```
+
+此工具对独立 FP32 reference 检查边界，比较候选的普通 Triton 与 TLE 分支，
+记录各自 autotune 的 best config。两者可能选择不同 block size，因此其耗时
+之比不是固定配置的原语消融。原始 Gems 与候选的比较仍使用本文三方 suite。
+TLE staging 不保证异步重叠或提速；需在设备上检查 IR 与实测结果。
+`--cpu-only` 只检查输入和参考计算，不代表 kernel 正确性。
+
 若优化后的 host launcher 改名，传入真实入口名称：
 
 ```text
