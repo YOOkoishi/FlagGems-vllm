@@ -20,6 +20,7 @@ benchmark_mqa_suite.py source-snapshot comparison for that separate question.
 """
 
 import argparse
+import faulthandler
 import importlib
 import inspect
 import json
@@ -52,6 +53,10 @@ SWITCHES = {
     "dense": "FLAGGEMS_FP8_FP4_MQA_LOGITS_TLE",
     "paged": "FLAGGEMS_FP8_FP4_PAGED_MQA_LOGITS_TLE",
 }
+
+
+def progress(message):
+    print(f"[MQA] {message}", flush=True)
 
 
 @dataclass
@@ -252,17 +257,20 @@ def fixtures(args):
 
 
 def load_operators(args, device):
+    progress(f"Checking CUDA/CoreX device {device}")
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError(
             "GPU validation requires an Iluvatar CoreX device; "
             "--cpu-only checks fixtures/references only"
         )
+    progress("Selecting device")
     torch.cuda.set_device(device)
     os.environ["GEMS_VENDOR"] = "iluvatar"
     os.environ["FLAGGEMS_ILUVATAR_MQA_EXPERIMENTAL"] = "1"
     from triton.compiler.compiler import make_backend
     from triton.runtime import driver
 
+    progress("Resolving the active Triton compiler")
     target = driver.active.get_current_target()
     backend = make_backend(target)
     compiler = type(backend)
@@ -270,9 +278,13 @@ def load_operators(args, device):
     identity = f"{compiler.__module__}.{compiler.__name__} {source}"
     if "iluvatar" not in identity.lower():
         raise RuntimeError(f"Actual compiler is not Iluvatar: {identity}; {target}")
+    progress(f"Compiler: {identity}; target: {target}")
+    progress("Checking CoreX libdevice")
     preflight = compiler_preflight("iluvatar", args.libdevice_path)
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    progress("Importing flaggems_vllm (includes other operator modules)")
     package = importlib.import_module("flaggems_vllm")
+    progress("Package import complete; checking public operator dispatch")
     functions = {}
     for operator, name in OPERATORS.items():
         if args.operator not in ("both", operator):
@@ -284,6 +296,7 @@ def load_operators(args, device):
         if not callable(getattr(module, "_launch_tle_kernel", None)):
             raise RuntimeError(f"Missing observable TLE launcher in {fn.__module__}")
         functions[operator] = (fn, module)
+        progress(f"{name} -> {fn.__module__}")
     return functions, {
         "device": torch.cuda.get_device_name(device),
         "target": str(target),
@@ -315,6 +328,7 @@ def validate_host_contract(functions, device):
     """Empty output and rejected formats must not reach the TLE launcher."""
     results = []
     for operator, (fn, module) in functions.items():
+        progress(f"{operator}: preparing empty/unsupported-input checks")
         if operator == "dense":
             base = dense_fixture("fp8", 1, 16, 67, True).on_device(device).kwargs
             empty_rows = dict(base)
@@ -358,6 +372,7 @@ def validate_host_contract(functions, device):
         for mode, enabled in (("plain", False), ("tle", True)):
             os.environ[SWITCHES[operator]] = "1" if enabled else "0"
             for name, kwargs, shape in empty_checks:
+                progress(f"{operator}/{mode}/{name}: checking empty output")
                 output, calls = observed_call(module, lambda: fn(**kwargs))
                 if (
                     tuple(output.shape) != shape
@@ -370,6 +385,7 @@ def validate_host_contract(functions, device):
                     )
                 results.append(f"{operator}/{mode}/{name}: empty, no TLE launch")
             for name, kwargs in rejects:
+                progress(f"{operator}/{mode}/{name}: checking rejection")
 
                 def rejected_call():
                     try:
@@ -400,6 +416,7 @@ def validate_case(case, functions, args, device):
     outputs, checks = {}, {}
     for mode, enabled in (("plain", False), ("tle", True)):
         os.environ[SWITCHES[case.operator]] = "1" if enabled else "0"
+        progress(f"{case.name}: {mode} launch (first call may compile/autotune)")
         output, calls = observed_call(module, run)
         synchronize(device)
         if (enabled and calls == 0) or (not enabled and calls != 0):
@@ -407,6 +424,7 @@ def validate_case(case, functions, args, device):
         checks[mode] = check_output(output, case, args.rtol, args.atol)
         checks[mode]["tle_launcher_calls"] = calls
         checks[mode]["best_config"] = selected_config(module, case.operator)
+        progress(f"{mode}: correctness PASS; config={checks[mode]['best_config']}")
         outputs[mode] = output
     checks["tle_vs_plain"] = check_output(
         outputs["tle"], replace(case, expected=outputs["plain"]), args.rtol, args.atol
@@ -417,6 +435,7 @@ def validate_case(case, functions, args, device):
         # are outside the timing windows. Only the public operator call is timed.
         for mode, enabled in (("plain", False), ("tle", True)):
             os.environ[SWITCHES[case.operator]] = "1" if enabled else "0"
+            progress(f"{case.name}: timing {mode}")
             timings[mode] = benchmark(
                 run, device, args.warmup, args.iterations, args.repeats
             )
@@ -452,6 +471,13 @@ def parse_args(argv=None):
     parser.add_argument("--rtol", type=float, default=2e-4)
     parser.add_argument("--atol", type=float, default=2e-3)
     parser.add_argument("--libdevice-path", type=Path)
+    parser.add_argument(
+        "--trace-timeout",
+        type=int,
+        default=0,
+        metavar="SECONDS",
+        help="Diagnostic only: periodically dump Python stacks; 0 disables it",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     if args.cpu_only and args.bench:
@@ -460,12 +486,19 @@ def parse_args(argv=None):
         parser.error("iterations/repeats must be positive and warmup nonnegative")
     if args.rtol < 0 or args.atol < 0:
         parser.error("tolerances must be nonnegative")
+    if args.trace_timeout < 0:
+        parser.error("trace-timeout must be nonnegative")
     return args
 
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.trace_timeout:
+        faulthandler.enable()
+        faulthandler.dump_traceback_later(args.trace_timeout, repeat=True)
+        progress(f"Diagnostic stack dumps enabled every {args.trace_timeout}s")
     device = torch.device("cpu" if args.cpu_only else args.device)
+    progress("Configuring Torch CPU threads and reference precision")
     torch.set_num_threads(min(4, torch.get_num_threads()))
     torch.set_float32_matmul_precision("highest")
     report = {
@@ -483,9 +516,11 @@ def main(argv=None):
             functions, report["environment"] = load_operators(args, device)
         with torch.inference_mode():
             if not args.cpu_only:
+                progress("Checking empty/unsupported inputs before kernel tests")
                 report["host_contract_checks"] = validate_host_contract(
                     functions, device
                 )
+            progress("Generating fixtures and starting correctness checks")
             for fixture in fixtures(args):
                 print(fixture.name, flush=True)
                 row = {"name": fixture.name, "status": "RUNNING"}
@@ -508,6 +543,9 @@ def main(argv=None):
         if report["cases"] and report["cases"][-1]["status"] == "RUNNING":
             report["cases"][-1]["status"] = "FAILED"
         print(report["error"], file=sys.stderr, flush=True)
+    finally:
+        if args.trace_timeout:
+            faulthandler.cancel_dump_traceback_later()
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, indent=2) + "\n")
