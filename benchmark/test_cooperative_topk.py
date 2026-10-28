@@ -20,7 +20,11 @@ from . import base
 
 pytestmark = [
     pytest.mark.cooperative_topk,
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    pytest.mark.skipif(
+        flaggems_vllm.device not in ("cuda", "musa")
+        or not flaggems_vllm.runtime.torch_device_fn.is_available(),
+        reason="CUDA or MUSA device required",
+    ),
 ]
 
 

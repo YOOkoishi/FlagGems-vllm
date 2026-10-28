@@ -11,7 +11,12 @@ from . import accuracy_utils as utils
 from . import conftest as cfg
 
 pytestmark = pytest.mark.cooperative_topk
-gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+device = flaggems_vllm.device
+torch_device_fn = flaggems_vllm.runtime.torch_device_fn
+gpu = pytest.mark.skipif(
+    device not in ("cuda", "musa") or not torch_device_fn.is_available(),
+    reason="CUDA or MUSA device required",
+)
 KS = [512, 1024, 2048]
 SHAPES = [(1, 513), (4, 4097), (4, 16384), (4, 16385), (1, 65539)]
 if not cfg.QUICK_MODE:
@@ -73,7 +78,7 @@ def _check(logits, lengths, output, k):
 def test_cooperative_topk_random(shape, k):
     torch.manual_seed(42)
     rows, width = shape
-    logits = torch.randn(rows, width, device="cuda")
+    logits = torch.randn(rows, width, device=device)
     lengths, output, workspace = _buffers(logits, [width] * rows, k)
     before = logits.clone()
     address = output.data_ptr()
@@ -92,23 +97,23 @@ def test_cooperative_topk_random(shape, k):
 def test_mixed_lengths_rank_two_poison_padding_and_workspace_reuse(k, width):
     # Rank-two lengths are flattened, without persistent_topk's MTP adjustment.
     host_lengths = [-3, 0, 1, k - 1, k, k + 1, width - 1, width]
-    storage = torch.full((8, width + 13), float("nan"), device="cuda")
+    storage = torch.full((8, width + 13), float("nan"), device=device)
     logits = storage[:, :width]
     lengths, output, workspace = _buffers(logits, host_lengths, k)
     lengths = lengths.view(2, 4)
     scratch_storage = torch.full(
-        (workspace.numel() + 64,), 251, dtype=torch.uint8, device="cuda"
+        (workspace.numel() + 64,), 251, dtype=torch.uint8, device=device
     )
     workspace = scratch_storage[32:-32]
     output_storage = torch.full(
-        (output.numel() + 64,), -71, dtype=torch.int32, device="cuda"
+        (output.numel() + 64,), -71, dtype=torch.int32, device=device
     )
     output = output_storage[32:-32].view(8, k)
     original_lengths = lengths.clone()
     for seed in (17, 29):
         torch.manual_seed(seed)
         for row, length in enumerate(host_lengths):
-            logits[row, : max(length, 0)] = torch.randn(max(length, 0), device="cuda")
+            logits[row, : max(length, 0)] = torch.randn(max(length, 0), device=device)
         workspace.fill_(seed)
         output.fill_(-17)
         # max_seq_len is compatibility metadata and must not truncate rows.
@@ -140,7 +145,7 @@ def test_mixed_lengths_rank_two_poison_padding_and_workspace_reuse(k, width):
     ],
 )
 def test_exact_selection_edge_values(width, distribution, k):
-    x = torch.arange(width, device="cuda", dtype=torch.float32)
+    x = torch.arange(width, device=device, dtype=torch.float32)
     if distribution == "equal":
         x.fill_(-1.25)
     elif distribution == "close":
@@ -161,7 +166,7 @@ def test_exact_selection_edge_values(width, distribution, k):
     else:
         # Construct subnormal bit patterns without arithmetic that could flush
         # them to zero before the operator receives its input.
-        x = torch.arange(width, device="cuda", dtype=torch.int32).remainder(7)
+        x = torch.arange(width, device=device, dtype=torch.int32).remainder(7)
         if distribution == "negative_subnormal":
             x = x.bitwise_or(-2147483648)
         x = x.view(torch.float32)
@@ -176,7 +181,7 @@ def test_exact_selection_edge_values(width, distribution, k):
 @gpu
 @pytest.mark.parametrize("shape", [(0, 4096), (4, 0), (1, 1)])
 def test_empty_and_single_element(shape):
-    logits = torch.empty(shape, device="cuda")
+    logits = torch.empty(shape, device=device)
     lengths, output, workspace = _buffers(logits, [shape[1]] * shape[0], 512)
     assert (
         flaggems_vllm.cooperative_topk(
@@ -192,7 +197,7 @@ def test_maximum_packed_histogram_count():
     # Every entry lands in one bin. The uint16 count must still be exact at
     # the largest width dispatched to the 64-partition path.
     width, k = 1048576, 512
-    logits = torch.full((1, width), 1.0, device="cuda")
+    logits = torch.full((1, width), 1.0, device=device)
     lengths, output, workspace = _buffers(logits, [width], k)
     flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
     _check(logits, lengths, output, k)
@@ -227,7 +232,7 @@ def test_maximum_packed_histogram_count():
 def test_invalid_inputs_rejected_before_output_mutation(broken):
     k = 512
     rows = 65 if broken == "rows" else 2
-    logits = torch.randn(rows, 4096, device="cuda")
+    logits = torch.randn(rows, 4096, device=device)
     lengths, output, workspace = _buffers(logits, [4096] * rows, k)
     if broken == "dtype":
         logits = logits.half()
@@ -249,7 +254,7 @@ def test_invalid_inputs_rejected_before_output_mutation(broken):
     elif broken == "lengths_rank":
         lengths = lengths.view(1, 1, rows)
     elif broken == "lengths_stride":
-        lengths = torch.full((rows * 2,), 4096, device="cuda", dtype=torch.int32)[::2]
+        lengths = torch.full((rows * 2,), 4096, device=device, dtype=torch.int32)[::2]
     elif broken == "output_dtype":
         output = output.long()
     elif broken == "output_shape":
@@ -262,11 +267,11 @@ def test_invalid_inputs_rejected_before_output_mutation(broken):
         workspace = workspace[:-1]
     elif broken == "workspace_stride":
         workspace = torch.empty(
-            workspace.numel() * 2, dtype=torch.uint8, device="cuda"
+            workspace.numel() * 2, dtype=torch.uint8, device=device
         )[::2]
     elif broken == "workspace_alignment":
         workspace = torch.empty(
-            workspace.numel() + 1, dtype=torch.uint8, device="cuda"
+            workspace.numel() + 1, dtype=torch.uint8, device=device
         )[1:]
     elif broken == "float_k":
         k = float(k)
@@ -292,7 +297,7 @@ def test_invalid_inputs_rejected_before_output_mutation(broken):
     ],
 )
 def test_unsupported_logits_dtype(dtype):
-    logits = torch.empty((2, 4096), dtype=dtype, device="cuda")
+    logits = torch.empty((2, 4096), dtype=dtype, device=device)
     lengths, output, workspace = _buffers(logits, [4096, 4096], 512)
     with pytest.raises(NotImplementedError, match="float32"):
         flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, 512, 4096)
@@ -305,7 +310,7 @@ def test_unsupported_logits_dtype(dtype):
     ["output_lengths", "output_workspace", "workspace_logits", "workspace_lengths"],
 )
 def test_mutable_buffers_cannot_alias_other_arguments(alias):
-    logits = torch.randn((2, 4096), device="cuda")
+    logits = torch.randn((2, 4096), device=device)
     lengths, output, workspace = _buffers(logits, [4096, 4096], 512)
     if alias == "output_lengths":
         lengths = output.reshape(-1)[:2]
@@ -324,7 +329,7 @@ def test_mutable_buffers_cannot_alias_other_arguments(alias):
 @gpu
 @pytest.mark.parametrize("argument", ["lengths", "output", "workspace"])
 def test_mixed_devices_rejected(argument):
-    logits = torch.randn((2, 4096), device="cuda")
+    logits = torch.randn((2, 4096), device=device)
     lengths, output, workspace = _buffers(logits, [4096, 4096], 512)
     tensors = {"lengths": lengths, "output": output, "workspace": workspace}
     tensors[argument] = tensors[argument].cpu()
@@ -345,31 +350,38 @@ def test_cpu_is_unsupported():
 @gpu
 @pytest.mark.parametrize("width", [4097, 65539])
 @pytest.mark.parametrize("k", [512] if cfg.QUICK_MODE else [512, 2048])
-def test_cuda_graph_replay_with_changed_values_and_lengths(width, k):
-    logits = torch.randn(4, width, device="cuda")
+def test_device_graph_replay_with_changed_values_and_lengths(width, k):
+    graph_type = getattr(
+        torch_device_fn, "MUSAGraph" if device == "musa" else "CUDAGraph", None
+    )
+    if graph_type is None or not hasattr(torch_device_fn, "graph"):
+        pytest.skip(f"{device} graph capture API is unavailable")
+    logits = torch.randn(4, width, device=device)
     lengths, output, workspace = _buffers(logits, [width] * 4, k)
     flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    torch_device_fn.synchronize()
+    graph = graph_type()
+    with torch_device_fn.graph(graph):
         flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
     for host_lengths in ([0, k - 1, k + 1, width], [width, 0, k, width // 2]):
         logits.normal_()
-        lengths.copy_(torch.tensor(host_lengths, dtype=torch.int32, device="cuda"))
+        lengths.copy_(torch.tensor(host_lengths, dtype=torch.int32, device=device))
         output.fill_(-17)
         graph.replay()
         _check(logits, lengths, output, k)
 
 
 @gpu
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Two CUDA devices required")
+@pytest.mark.skipif(
+    torch_device_fn.device_count() < 2, reason="Two backend devices required"
+)
 def test_input_device_differs_from_current_device():
-    with torch.cuda.device(0):
-        logits = torch.randn((4, 65539), device="cuda:1")
+    with torch_device_fn.device(0):
+        logits = torch.randn((4, 65539), device=f"{device}:1")
         lengths, output, workspace = _buffers(logits, [0, 512, 513, 65539], 512)
         flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, 512, 65539)
         _check(logits, lengths, output, 512)
-        assert torch.cuda.current_device() == 0
+        assert torch_device_fn.current_device() == 0
 
 
 @gpu
@@ -384,7 +396,7 @@ def test_vllm_cross_agreement_when_available(k, width):
     pytest.importorskip("vllm._custom_ops")
     if not hasattr(torch.ops._C, "cooperative_topk"):
         pytest.skip("vLLM build does not expose cooperative_topk")
-    logits = torch.randn(4, width, device="cuda")
+    logits = torch.randn(4, width, device=device)
     lengths, output, workspace = _buffers(logits, [1, k + 1, width // 2, width], k)
     reference = torch.empty_like(output)
     torch.ops._C.cooperative_topk(logits, lengths, reference, workspace, k, width)
