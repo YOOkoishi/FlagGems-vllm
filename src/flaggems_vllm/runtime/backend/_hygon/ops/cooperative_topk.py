@@ -46,6 +46,14 @@ else:
     tle = None
     HAS_TLE = False
 
+HAS_TLE = bool(
+    HAS_TLE
+    and hasattr(tle, "gpu")
+    and hasattr(tle.gpu, "alloc")
+    and hasattr(tle.gpu, "local_ptr")
+    and hasattr(tle.gpu, "smem")
+)
+
 
 if HAS_TLE:
 
