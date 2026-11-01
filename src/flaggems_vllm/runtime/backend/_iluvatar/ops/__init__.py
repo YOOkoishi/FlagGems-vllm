@@ -15,6 +15,9 @@
 from flaggems_vllm.runtime.backend._iluvatar.ops.compress_norm_mrope import (
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._iluvatar.ops.cooperative_topk import (
+    cooperative_topk,
+)
 from flaggems_vllm.runtime.backend._iluvatar.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
@@ -31,7 +34,6 @@ from flaggems_vllm.runtime.backend._iluvatar.ops.qsa_mqa import qwen4_qsa_mqa_pa
 from flaggems_vllm.runtime.backend._iluvatar.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
-from flaggems_vllm.runtime.backend._iluvatar.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.runtime.backend._iluvatar.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )

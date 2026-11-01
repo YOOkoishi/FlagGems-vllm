@@ -24,13 +24,13 @@ uses the shared implementation unchanged.
 import triton
 import triton.language as tl
 
+from flaggems_vllm import runtime
 from flaggems_vllm.ops.cooperative_topk import (
     _cooperative_topk_impl,
     _key_greater,
     _ordered_key,
     _radix_digit,
 )
-from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 

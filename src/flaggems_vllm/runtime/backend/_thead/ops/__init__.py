@@ -15,6 +15,7 @@
 
 import flag_gems
 
+from flaggems_vllm.runtime.backend._thead.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.runtime.backend._thead.ops.fused_moe import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -30,7 +31,6 @@ from flaggems_vllm.runtime.backend._thead.ops.per_token_group_quant_fp8 import (
     per_token_group_quant_fp8,
 )
 from flaggems_vllm.runtime.backend._thead.ops.persistent_topk import persistent_topk
-from flaggems_vllm.runtime.backend._thead.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.runtime.backend._thead.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )

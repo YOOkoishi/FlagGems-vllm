@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from flaggems_vllm.runtime.backend._hygon.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.runtime.backend._hygon.ops.compress_norm_mrope import (  # noqa: F401
     qwen4_compress_norm_mrope_store_groups,
 )
+from flaggems_vllm.runtime.backend._hygon.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.runtime.backend._hygon.ops.deepseek_v4_attention_fused_q_kv_rmsnorm import (
     fused_q_kv_rmsnorm,
 )
