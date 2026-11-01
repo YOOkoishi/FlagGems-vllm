@@ -279,8 +279,15 @@ def _memory_interval(tensor):
     return start, start + span * tensor.element_size()
 
 
-def cooperative_topk(logits, lengths, output, workspace, k, max_seq_len):
-    """Write unsorted top-k indices into ``output`` and return ``None``.
+def _cooperative_topk_impl(
+    logits, lengths, output, workspace, k, max_seq_len, small_kernel=None
+):
+    """Implementation shared by the generic and vendor-specialized entrypoints.
+
+    ``small_kernel`` is an internal hook used by vendor backends to replace the
+    narrow-row launch with a TLE-staged kernel.  Validation, workspace rules,
+    and the wide-row radix protocol remain shared so backend overrides cannot
+    silently drift from the public vLLM ABI.
 
     ``logits`` is FP32 [rows, width] with contiguous columns; ``lengths``
     is contiguous INT32 with one entry per row (rank 1 or 2). Callers must
@@ -359,7 +366,8 @@ def cooperative_topk(logits, lengths, output, workspace, k, max_seq_len):
         # Larger register tiles spill heavily on SM120; partition those rows
         # instead of keeping a full 16K-element row live through the scans.
         if width <= 8192:
-            _cooperative_topk_small[(rows,)](
+            kernel = small_kernel or _cooperative_topk_small
+            kernel[(rows,)](
                 logits,
                 lengths,
                 output,
@@ -428,3 +436,13 @@ def cooperative_topk(logits, lengths, output, workspace, k, max_seq_len):
                 parts,
                 bits,
             )
+
+
+def cooperative_topk(logits, lengths, output, workspace, k, max_seq_len):
+    """Write unsorted top-k indices into ``output`` and return ``None``.
+
+    The public contract is documented on the shared implementation above;
+    this wrapper intentionally keeps the vLLM-compatible six-argument
+    signature used by dispatch and CUDA graph capture.
+    """
+    return _cooperative_topk_impl(logits, lengths, output, workspace, k, max_seq_len)
