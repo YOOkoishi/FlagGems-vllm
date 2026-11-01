@@ -88,7 +88,7 @@ if HAS_TLE:
             scope=tle.gpu.smem,
             nv_mma_shared_layout=False,
         )
-        shared_keys_ptr = tle.gpu.local_ptr(shared_keys, (0,))
+        shared_keys_ptr = tle.gpu.local_ptr(shared_keys, (offsets,))
 
         if length <= K:
             short_indices = tl.arange(0, K)
@@ -99,9 +99,9 @@ if HAS_TLE:
         else:
             values = tl.load(Logits + row * STRIDE + offsets, valid, other=0.0)
             keys = _ordered_key(values)
-            tl.store(shared_keys_ptr + offsets, keys, mask=valid)
+            tl.store(shared_keys_ptr, keys, mask=valid)
             tl.debug_barrier()
-            keys = tl.load(shared_keys_ptr + offsets, mask=valid, other=0)
+            keys = tl.load(shared_keys_ptr, mask=valid, other=0)
             prefix = tl.full((), 0, tl.uint32)
             remaining = tl.full((), K, tl.int32)
             candidates = valid
