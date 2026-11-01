@@ -17,7 +17,7 @@
 The public ABI and wide-row radix protocol are shared with the generic
 implementation.  Moore Threads TLE backend stages the ordered key tile in shared
 memory before the radix scans, which bounds the live register tile on DCU
-architectures.  If the installed Triton build has no TLE support, dispatch
+Moore Threads architectures.  If the installed Triton build has no TLE support, dispatch
 uses the shared implementation unchanged.
 """
 
@@ -45,6 +45,14 @@ if has_triton_tle(3, 6, 0):
 else:
     tle = None
     HAS_TLE = False
+
+HAS_TLE = bool(
+    HAS_TLE
+    and hasattr(tle, "gpu")
+    and hasattr(tle.gpu, "alloc")
+    and hasattr(tle.gpu, "local_ptr")
+    and hasattr(tle.gpu, "smem")
+)
 
 
 if HAS_TLE:
@@ -115,7 +123,7 @@ else:
 
 
 def cooperative_topk(logits, lengths, output, workspace, k, max_seq_len):
-    """Run cooperative top-k with the Hygon TLE narrow-row specialization."""
+    """Run cooperative top-k with the Moore Threads TLE narrow-row specialization."""
     return _cooperative_topk_impl(
         logits,
         lengths,

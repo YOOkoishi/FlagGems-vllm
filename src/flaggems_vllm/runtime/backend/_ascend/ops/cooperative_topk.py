@@ -39,7 +39,7 @@ try:
         hasattr(tle, name) for name in ("dsa",)
     ) and all(
         hasattr(tle.dsa, name) for name in ("to_buffer", "to_tensor")
-    ) and hasattr(tle.dsa, "ascend")
+    ) and hasattr(tle.dsa, "ascend") and hasattr(tle.dsa.ascend, "UB")
 except ImportError:
     tle = None
     _HAS_TLE_DSA = False
