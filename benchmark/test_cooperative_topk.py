@@ -4,7 +4,7 @@
 
 Each shape has homogeneous full-row lengths. The torch baseline includes the
 int64-to-int32 output copy and short-row padding required by the public API.
-No device-to-host length reads occur in timed or CUDA-graph-captured code.
+No device-to-host length reads occur in timed or graph-captured code.
 The core set covers the short-row path, the 16384 regression cases, padded
 rows and million-column rows. Comprehensive adds the rows/width/k sweep.
 Report each shape's latency and SpeedUp separately; the default kernel mode
@@ -21,9 +21,9 @@ from . import base
 pytestmark = [
     pytest.mark.cooperative_topk,
     pytest.mark.skipif(
-        flaggems_vllm.device not in ("cuda", "musa")
+        flaggems_vllm.device not in ("cuda", "musa", "npu")
         or not flaggems_vllm.runtime.torch_device_fn.is_available(),
-        reason="CUDA or MUSA device required",
+        reason="CUDA, MUSA or NPU device required",
     ),
 ]
 

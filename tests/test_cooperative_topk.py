@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright 2026 FlagOS Contributors
 """Contract tests for vLLM's in-place cooperative top-k interface."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -14,8 +16,8 @@ pytestmark = pytest.mark.cooperative_topk
 device = flaggems_vllm.device
 torch_device_fn = flaggems_vllm.runtime.torch_device_fn
 gpu = pytest.mark.skipif(
-    device not in ("cuda", "musa") or not torch_device_fn.is_available(),
-    reason="CUDA or MUSA device required",
+    device not in ("cuda", "musa", "npu") or not torch_device_fn.is_available(),
+    reason="CUDA, MUSA or NPU device required",
 )
 KS = [512, 1024, 2048]
 SHAPES = [(1, 513), (4, 4097), (4, 16384), (4, 16385), (1, 65539)]
@@ -43,13 +45,13 @@ def _buffers(logits, lengths, k):
     return lengths, output, workspace
 
 
-def _check(logits, lengths, output, k):
+def _check(logits, lengths, output, k, reference_on_cpu=False):
     # Compare selected values, not tie indices or output order. Do not infer
     # padding from score values: valid entries may themselves contain -inf.
-    reference_logits = utils.to_reference(logits)
+    reference_logits = logits.cpu() if reference_on_cpu else utils.to_reference(logits)
     for row, length in enumerate(lengths.reshape(-1).cpu().tolist()):
         length = max(length, 0)
-        indices = output[row].long()
+        indices = output[row].to(device=reference_logits.device, dtype=torch.int64)
         if length <= k:
             expected = torch.full(
                 (k,), -1, dtype=torch.int64, device=reference_logits.device
@@ -59,7 +61,7 @@ def _check(logits, lengths, output, k):
             continue
         assert torch.all((indices >= 0) & (indices < length))
         assert indices.unique().numel() == k
-        selected = utils.to_reference(logits[row, indices])
+        selected = reference_logits[row, indices]
         expected = reference_logits[row, :length].topk(k, sorted=False).values
         # CUDA and CPU can order negative NaNs differently. The API promises
         # a value multiset, so check NaN multiplicity and exact non-NaN values.
@@ -145,7 +147,10 @@ def test_mixed_lengths_rank_two_poison_padding_and_workspace_reuse(k, width):
     ],
 )
 def test_exact_selection_edge_values(width, distribution, k):
-    x = torch.arange(width, device=device, dtype=torch.float32)
+    # Keep the oracle and special-value preparation independent of NPU floating
+    # point arithmetic, which can flush subnormals before selection is tested.
+    input_device = "cpu" if device == "npu" else device
+    x = torch.arange(width, device=input_device, dtype=torch.float32)
     if distribution == "equal":
         x.fill_(-1.25)
     elif distribution == "close":
@@ -166,16 +171,16 @@ def test_exact_selection_edge_values(width, distribution, k):
     else:
         # Construct subnormal bit patterns without arithmetic that could flush
         # them to zero before the operator receives its input.
-        x = torch.arange(width, device=device, dtype=torch.int32).remainder(7)
+        x = torch.arange(width, device=input_device, dtype=torch.int32).remainder(7)
         if distribution == "negative_subnormal":
             x = x.bitwise_or(-2147483648)
         x = x.view(torch.float32)
         x[::5] = -0.0
         x[::11] = 0.0
-    logits = x.unsqueeze(0)
+    logits = x.to(device).unsqueeze(0)
     lengths, output, workspace = _buffers(logits, [width], k)
     flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, k, width)
-    _check(logits, lengths, output, k)
+    _check(logits, lengths, output, k, reference_on_cpu=device == "npu")
 
 
 @gpu
@@ -242,7 +247,13 @@ def test_invalid_inputs_rejected_before_output_mutation(broken):
     elif broken == "logits_rank":
         logits = logits.unsqueeze(0)
     elif broken == "logits_layout":
-        logits = logits.to_sparse()
+        if device == "npu":
+            # Sparse NPU allocation is not required to test this metadata guard.
+            logits = SimpleNamespace(
+                device=logits.device, dtype=logits.dtype, layout=torch.sparse_coo
+            )
+        else:
+            logits = logits.to_sparse()
     elif broken == "column_stride":
         logits = logits[:, ::2]
     elif broken == "row_stride":
@@ -297,8 +308,16 @@ def test_invalid_inputs_rejected_before_output_mutation(broken):
     ],
 )
 def test_unsupported_logits_dtype(dtype):
-    logits = torch.empty((2, 4096), dtype=dtype, device=device)
+    metadata_only = (dtype == torch.float64 and not utils.fp64_is_supported) or (
+        device == "npu" and dtype == torch.complex64
+    )
+    logits = torch.empty(
+        (2, 4096), dtype=torch.float32 if metadata_only else dtype, device=device
+    )
     lengths, output, workspace = _buffers(logits, [4096, 4096], 512)
+    if metadata_only:
+        # Exercise the dtype rejection without requiring unsupported storage.
+        logits = SimpleNamespace(device=logits.device, dtype=dtype)
     with pytest.raises(NotImplementedError, match="float32"):
         flaggems_vllm.cooperative_topk(logits, lengths, output, workspace, 512, 4096)
     assert torch.all(output == -17)
@@ -352,7 +371,9 @@ def test_cpu_is_unsupported():
 @pytest.mark.parametrize("k", [512] if cfg.QUICK_MODE else [512, 2048])
 def test_device_graph_replay_with_changed_values_and_lengths(width, k):
     graph_type = getattr(
-        torch_device_fn, "MUSAGraph" if device == "musa" else "CUDAGraph", None
+        torch_device_fn,
+        {"cuda": "CUDAGraph", "musa": "MUSAGraph", "npu": "NPUGraph"}[device],
+        None,
     )
     if graph_type is None or not hasattr(torch_device_fn, "graph"):
         pytest.skip(f"{device} graph capture API is unavailable")
