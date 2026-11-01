@@ -48,6 +48,7 @@ from flaggems_vllm.runtime.backend._mthreads.ops.qsa_mqa import qwen4_qsa_mqa_pa
 from flaggems_vllm.runtime.backend._mthreads.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
+from flaggems_vllm.runtime.backend._mthreads.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.runtime.backend._mthreads.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
@@ -74,6 +75,7 @@ __all__ = [
     "qwen4_store_qsa_kv_rows",
     "scaled_int8_quant",
     "SUPPORTED_FP8_DTYPE",
+    "cooperative_topk",
     "topk_softplus_sqrt",
     "w8a8_block_fp8_matmul",
 ]
