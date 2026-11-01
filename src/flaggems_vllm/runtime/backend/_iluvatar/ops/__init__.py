@@ -31,6 +31,7 @@ from flaggems_vllm.runtime.backend._iluvatar.ops.qsa_mqa import qwen4_qsa_mqa_pa
 from flaggems_vllm.runtime.backend._iluvatar.ops.scaled_int8_quant import (
     scaled_int8_quant,
 )
+from flaggems_vllm.runtime.backend._iluvatar.ops.cooperative_topk import cooperative_topk
 from flaggems_vllm.runtime.backend._iluvatar.ops.topk_softplus_sqrt import (
     topk_softplus_sqrt,
 )
@@ -45,5 +46,6 @@ __all__ = [
     "qwen4_qsa_mqa_paged_dot",
     "qwen4_store_qsa_kv_rows",
     "scaled_int8_quant",
+    "cooperative_topk",
     "topk_softplus_sqrt",
 ]
