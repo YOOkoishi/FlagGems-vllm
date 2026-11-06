@@ -55,9 +55,9 @@ class CooperativeTopKBenchmark(base.Benchmark):
         return [
             (rows, width, k)
             for rows in (1, 4, 16, 64)
-            for width in (4096, 16384, 16385, 65536, 262144, 1048576)
+            for width in (4096, 8192, 8193, 16384, 16385, 65536, 262144, 1048576)
             for k in (512, 1024, 2048)
-        ]
+        ] + [(17, 16384, 1024)]
 
     def get_input_iter(self, dtype):
         for rows, width, k in self.shapes:

@@ -20,11 +20,20 @@ gpu = pytest.mark.skipif(
     reason="CUDA, MUSA or NPU device required",
 )
 KS = [512, 1024, 2048]
-SHAPES = [(1, 513), (4, 4097), (4, 16384), (4, 16385), (1, 65539)]
+SHAPES = [
+    (1, 513),
+    (4, 4097),
+    (4, 8192),
+    (4, 8193),
+    (4, 16384),
+    (16, 16384),
+    (17, 16384),
+    (64, 16384),
+    (4, 16385),
+    (1, 65539),
+]
 if not cfg.QUICK_MODE:
     SHAPES += [
-        (4, 8192),
-        (4, 8193),
         (16, 65536),
         (17, 65536),
         (64, 32771),
@@ -95,7 +104,7 @@ def test_cooperative_topk_random(shape, k):
 
 @gpu
 @pytest.mark.parametrize("k", KS)
-@pytest.mark.parametrize("width", [4097, 65539])
+@pytest.mark.parametrize("width", [4097, 16384, 65539])
 def test_mixed_lengths_rank_two_poison_padding_and_workspace_reuse(k, width):
     # Rank-two lengths are flattened, without persistent_topk's MTP adjustment.
     host_lengths = [-3, 0, 1, k - 1, k, k + 1, width - 1, width]
@@ -131,7 +140,7 @@ def test_mixed_lengths_rank_two_poison_padding_and_workspace_reuse(k, width):
 
 @gpu
 @pytest.mark.parametrize("k", [512] if cfg.QUICK_MODE else KS)
-@pytest.mark.parametrize("width", [4097, 65539])
+@pytest.mark.parametrize("width", [4097, 16384, 65539])
 @pytest.mark.parametrize(
     "distribution",
     [
@@ -367,7 +376,7 @@ def test_cpu_is_unsupported():
 
 
 @gpu
-@pytest.mark.parametrize("width", [4097, 65539])
+@pytest.mark.parametrize("width", [4097, 16384, 65539])
 @pytest.mark.parametrize("k", [512] if cfg.QUICK_MODE else [512, 2048])
 def test_device_graph_replay_with_changed_values_and_lengths(width, k):
     graph_type = getattr(
@@ -427,8 +436,15 @@ def test_vllm_cross_agreement_when_available(k, width):
 
 
 def test_export_and_registration():
-    assert flaggems_vllm.ops.cooperative_topk is flaggems_vllm.cooperative_topk
+    assert "cooperative_topk" in flaggems_vllm.ops.__all__
+    assert callable(flaggems_vllm.ops.cooperative_topk)
     assert any(
         name == "cooperative_topk" and fn is flaggems_vllm.cooperative_topk
         for name, fn in flaggems_vllm._FULL_CONFIG
     )
+    if flaggems_vllm.vendor_name == "mthreads":
+        from flaggems_vllm.runtime.backend._mthreads.ops.cooperative_topk import (
+            cooperative_topk as mthreads_cooperative_topk,
+        )
+
+        assert flaggems_vllm.cooperative_topk is mthreads_cooperative_topk

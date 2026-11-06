@@ -280,14 +280,23 @@ def _memory_interval(tensor):
 
 
 def _cooperative_topk_impl(
-    logits, lengths, output, workspace, k, max_seq_len, small_kernel=None
+    logits,
+    lengths,
+    output,
+    workspace,
+    k,
+    max_seq_len,
+    small_kernel=None,
+    *,
+    small_max_width=8192,
+    small_max_rows=64,
 ):
     """Implementation shared by the generic and vendor-specialized entrypoints.
 
-    ``small_kernel`` is an internal hook used by vendor backends to replace the
-    narrow-row launch with a TLE-staged kernel.  Validation, workspace rules,
-    and the wide-row radix protocol remain shared so backend overrides cannot
-    silently drift from the public vLLM ABI.
+    Vendor backends can replace ``small_kernel`` or extend the single-CTA path
+    through ``small_max_width`` and ``small_max_rows``. Rows up to width 8192
+    always use the small kernel. Validation, workspace rules, and the wide-row
+    radix protocol are shared across backends.
 
     ``logits`` is FP32 [rows, width] with contiguous columns; ``lengths``
     is contiguous INT32 with one entry per row (rank 1 or 2). Callers must
@@ -363,9 +372,9 @@ def _cooperative_topk_impl(
         return
 
     with runtime.torch_device_fn.device(logits.device):
-        # Larger register tiles spill heavily on SM120; partition those rows
-        # instead of keeping a full 16K-element row live through the scans.
-        if width <= 8192:
+        # Keep the default tile bound at 8192; vendor limits can extend the
+        # single-CTA path for batches where it beats the partitioned launches.
+        if width <= 8192 or (width <= small_max_width and rows <= small_max_rows):
             kernel = small_kernel or _cooperative_topk_small
             kernel[(rows,)](
                 logits,
